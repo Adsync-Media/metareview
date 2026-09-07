@@ -1,0 +1,219 @@
+diff --git a/spec/components/topic_retriever_spec.rb b/spec/components/topic_retriever_spec.rb
+new file mode 100644
+index 00000000000..2e7810be98f
+--- /dev/null
++++ b/spec/components/topic_retriever_spec.rb
+@@ -0,0 +1,46 @@
++require 'spec_helper'
++require_dependency 'topic_retriever'
++
++describe TopicRetriever do
++
++  let(:embed_url) { "http://eviltrout.com/2013/02/10/why-discourse-uses-emberjs.html" }
++  let(:topic_retriever) { TopicRetriever.new(embed_url) }
++
++  it "does not call perform_retrieve when embeddable_host is not set" do
++    SiteSetting.expects(:embeddable_host).returns(nil)
++    topic_retriever.expects(:perform_retrieve).never
++    topic_retriever.retrieve
++  end
++
++  it "does not call perform_retrieve when embeddable_host is different than the host of the URL" do
++    SiteSetting.expects(:embeddable_host).returns("eviltuna.com")
++    topic_retriever.expects(:perform_retrieve).never
++    topic_retriever.retrieve
++  end
++
++  it "does not call perform_retrieve when the embed url is not a url" do
++    r = TopicRetriever.new("not a url")
++    r.expects(:perform_retrieve).never
++    r.retrieve
++  end
++
++  context "with a valid host" do
++    before do
++      SiteSetting.expects(:embeddable_host).returns("eviltrout.com")
++    end
++
++    it "calls perform_retrieve if it hasn't been retrieved recently" do
++      topic_retriever.expects(:perform_retrieve).once
++      topic_retriever.expects(:retrieved_recently?).returns(false)
++      topic_retriever.retrieve
++    end
++
++    it "doesn't call perform_retrieve if it's been retrieved recently" do
++      topic_retriever.expects(:perform_retrieve).never
++      topic_retriever.expects(:retrieved_recently?).returns(true)
++      topic_retriever.retrieve
++    end
++
++  end
++
++end
+
+diff --git a/spec/controllers/embed_controller_spec.rb b/spec/controllers/embed_controller_spec.rb
+new file mode 100644
+index 00000000000..52661962167
+--- /dev/null
++++ b/spec/controllers/embed_controller_spec.rb
+@@ -0,0 +1,58 @@
++require 'spec_helper'
++
++describe EmbedController do
++
++  let(:host) { "eviltrout.com" }
++  let(:embed_url) { "http://eviltrout.com/2013/02/10/why-discourse-uses-emberjs.html" }
++
++  it "is 404 without an embed_url" do
++    get :best
++    response.should_not be_success
++  end
++
++  it "raises an error with a missing host" do
++    SiteSetting.stubs(:embeddable_host).returns(nil)
++    get :best, embed_url: embed_url
++    response.should_not be_success
++  end
++
++  context "with a host" do
++    before do
++      SiteSetting.stubs(:embeddable_host).returns(host)
++    end
++
++    it "raises an error with no referer" do
++      get :best, embed_url: embed_url
++      response.should_not be_success
++    end
++
++    context "success" do
++
++      before do
++        controller.request.stubs(:referer).returns(embed_url)
++      end
++
++      after do
++        response.should be_success
++        response.headers['X-Frame-Options'].should == "ALLOWALL"
++      end
++
++      it "tells the topic retriever to work when no previous embed is found" do
++        TopicEmbed.expects(:topic_id_for_embed).returns(nil)
++        retriever = mock
++        TopicRetriever.expects(:new).returns(retriever)
++        retriever.expects(:retrieve)
++        get :best, embed_url: embed_url
++      end
++
++      it "creates a topic view when a topic_id is found" do
++        TopicEmbed.expects(:topic_id_for_embed).returns(123)
++        TopicView.expects(:new).with(123, nil, {best: 5})
++        get :best, embed_url: embed_url
++      end
++    end
++
++  end
++
++
++end
+
+diff --git a/spec/jobs/poll_feed_spec.rb b/spec/jobs/poll_feed_spec.rb
+new file mode 100644
+index 00000000000..e2648338b73
+--- /dev/null
++++ b/spec/jobs/poll_feed_spec.rb
+@@ -0,0 +1,40 @@
++require 'spec_helper'
++require_dependency 'jobs/regular/process_post'
++
++describe Jobs::PollFeed do
++
++  let(:poller) { Jobs::PollFeed.new }
++
++  context "execute" do
++    let(:url) { "http://eviltrout.com" }
++    let(:embed_by_username) { "eviltrout" }
++
++    it "requires feed_polling_enabled?" do
++      SiteSetting.stubs(:feed_polling_enabled?).returns(false)
++      poller.expects(:poll_feed).never
++      poller.execute({})
++    end
++
++    it "requires feed_polling_url" do
++      SiteSetting.stubs(:feed_polling_url).returns(nil)
++      poller.expects(:poll_feed).never
++      poller.execute({})
++    end
++
++    it "requires embed_by_username" do
++      SiteSetting.stubs(:embed_by_username).returns(nil)
++      poller.expects(:poll_feed).never
++      poller.execute({})
++    end
++
++
++    it "delegates to poll_feed" do
++      SiteSetting.stubs(:feed_polling_enabled?).returns(true)
++      SiteSetting.stubs(:feed_polling_url).returns(url)
++      SiteSetting.stubs(:embed_by_username).returns(embed_by_username)
++      poller.expects(:poll_feed).once
++      poller.execute({})
++    end
++  end
++
++end
+
+diff --git a/spec/models/topic_embed_spec.rb b/spec/models/topic_embed_spec.rb
+new file mode 100644
+index 00000000000..3db8aaf0738
+--- /dev/null
++++ b/spec/models/topic_embed_spec.rb
+@@ -0,0 +1,48 @@
++require 'spec_helper'
++
++describe TopicEmbed do
++
++  it { should belong_to :topic }
++  it { should belong_to :post }
++  it { should validate_presence_of :embed_url }
++  it { should validate_presence_of :content_sha1 }
++
++
++  context '.import' do
++
++    let(:user) { Fabricate(:user) }
++    let(:title) { "How to turn a fish from good to evil in 30 seconds" }
++    let(:url) { 'http://eviltrout.com/123' }
++    let(:contents) { "hello world new post <a href='/hello'>hello</a> <img src='/images/wat.jpg'>" }
++
++    it "returns nil when the URL is malformed" do
++      TopicEmbed.import(user, "invalid url", title, contents).should be_nil
++      TopicEmbed.count.should == 0
++    end
++
++    context 'creation of a post' do
++      let!(:post) { TopicEmbed.import(user, url, title, contents) }
++
++      it "works as expected with a new URL" do
++        post.should be_present
++
++        # It uses raw_html rendering
++        post.cook_method.should == Post.cook_methods[:raw_html]
++        post.cooked.should == post.raw
++
++        # It converts relative URLs to absolute
++        post.cooked.start_with?("hello world new post <a href=\"http://eviltrout.com/hello\">hello</a> <img src=\"http://eviltrout.com/images/wat.jpg\">").should be_true
++
++        TopicEmbed.where(topic_id: post.topic_id).should be_present
++      end
++
++      it "Supports updating the post" do
++        post = TopicEmbed.import(user, url, title, "muhahaha new contents!")
++        post.cooked.should =~ /new contents/
++      end
++
++    end
++
++  end
++
++end

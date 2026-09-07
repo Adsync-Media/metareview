@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/dsifry/metareview/internal/claimcheck"
 	"github.com/dsifry/metareview/internal/fsm/converge"
 	"github.com/dsifry/metareview/internal/fsm/errs"
 	"github.com/dsifry/metareview/internal/fsm/judge"
@@ -461,6 +462,9 @@ func callAs(ctx context.Context, j judge.Judge, in machine.ExecInput, req judge.
 	if esc != nil {
 		data.Evidence, data.TreeHash, data.BaseSHA, data.HeadSHA = esc.Evidence, esc.TreeHash, esc.BaseSHA, esc.HeadSHA
 	}
+	if req.Claim != nil {
+		data.ClaimClass, data.ClaimEvidence = string(req.Claim.Class), req.Claim.Evidence
+	}
 	if v.Parsed != nil {
 		data.Verdict = v.Parsed
 	}
@@ -557,8 +561,39 @@ func (e *adjudicateExec) Execute(ctx context.Context, in machine.ExecInput) (jso
 		}
 	}
 	var rejected []run.Bug
+	// #140's per-run metric: testing-gap claims made, how many had covering-test evidence
+	// in the diff, and how each was ruled. Claims-made is the denominator the issue asks
+	// for ("claims made vs claims verified absent"); verified-absent is the confirmed count
+	// below with zero evidence found.
+	gapClaims, gapEvidence, gapConfirmed, gapConfirmedNoEvidence, gapRejected, gapRejectedEvidence, gapUnverified := 0, 0, 0, 0, 0, 0, 0
 	for c, cand := range cands {
+		// #140: detect the claim class before ANY branch that can resolve a candidate
+		// without it — including the golden-match skip. A claim is MADE regardless of how
+		// it is resolved (matched, adjudicated, or kept for a human), and the metric's
+		// denominator counts claims, not adjudicated claims.
+		var claim *judge.ClaimInfo
+		if class, ok := claimcheck.Detect(cand.IssueText); ok {
+			claim = &judge.ClaimInfo{Class: class}
+			gapClaims++
+			// Evidence is computed for EVERY gap claim, before any branch that can
+			// resolve the candidate without it (CodeRabbit #145): a golden-matched
+			// claim's with_evidence must count too, and the context branch reuses the
+			// paths found here.
+			for _, e := range judge.GapClaimEvidence(in.Diff.Text, cand, judge.MaxGapEvidenceFiles) {
+				claim.Evidence = append(claim.Evidence, e.Path)
+			}
+			if len(claim.Evidence) > 0 {
+				gapEvidence++
+			}
+		}
 		if seen[c] {
+			// A golden-matched gap claim is a true positive by the eval's own standard
+			// (the golden IS the human-verified finding). It counts as made + confirmed —
+			// but not as confirmed_without_evidence, the metric's verified-absent: the
+			// match verified the finding, not the absence the claim asserts.
+			if claim != nil {
+				gapConfirmed++
+			}
 			continue
 		}
 		// No evidence, no question. The verdict schema is one boolean, so a judge that cannot
@@ -571,10 +606,26 @@ func (e *adjudicateExec) Execute(ctx context.Context, in machine.ExecInput) (jso
 		if cand.File != "" && len(judge.ChangedPaths(in.Diff.Text)) > 0 && !judge.DiffHasFile(in.Diff.Text, cand.File) {
 			desc, _ := run.CapText(cand.IssueText, run.MaxDesc)
 			confirmed = append(confirmed, run.Bug{ID: run.FindingKey(cand.File, cand.IssueText), Desc: desc, File: cand.File, Line: cand.Line, Verdict: run.VerdictUnverifiedNoEvidence})
+			if claim != nil {
+				gapUnverified++
+			}
 			continue
 		}
-		diff, truncated, diffHash := judge.ContextForClaim(in.Diff.Text, in.Diff.Truncated, cand.File, cand.Line, cand.IssueText, judge.MaxDiffBytes)
-		v, err := call(ctx, e.judge, in, judge.Request{Kind: judge.KindAdjudicate, Index: index, Input: judge.AdjudicateInput{Diff: diff, DiffTruncated: truncated, DiffContextHash: diffHash, Candidate: cand}})
+		// A finding that asserts absent tests is adjudicated against the test files
+		// the diff actually changes (ContextForGapClaim), so the judge verifies the claimed
+		// absence the same way it verifies claimed defects - the cal.com miss was a claim
+		// whose contradicting spec sat in the same diff and was never shown.
+		var diff string
+		var truncated bool
+		var diffHash string
+		if claim != nil {
+			// claim.Evidence was computed before the golden-match skip; the selection
+			// here only builds the judge's prompt.
+			diff, truncated, diffHash, _ = judge.ContextForGapClaim(in.Diff.Text, in.Diff.Truncated, cand, judge.MaxDiffBytes)
+		} else {
+			diff, truncated, diffHash = judge.ContextForClaim(in.Diff.Text, in.Diff.Truncated, cand.File, cand.Line, cand.IssueText, judge.MaxDiffBytes)
+		}
+		v, err := call(ctx, e.judge, in, judge.Request{Kind: judge.KindAdjudicate, Index: index, Input: judge.AdjudicateInput{Diff: diff, DiffTruncated: truncated, DiffContextHash: diffHash, Candidate: cand}, Claim: claim})
 		index++
 		if err != nil {
 			return nil, err
@@ -584,17 +635,72 @@ func (e *adjudicateExec) Execute(ctx context.Context, in machine.ExecInput) (jso
 		if v.ParseError != "" {
 			desc, _ := run.CapText(cand.IssueText, run.MaxDesc)
 			confirmed = append(confirmed, run.Bug{ID: run.FindingKey(cand.File, cand.IssueText), Desc: desc, File: cand.File, Line: cand.Line, Verdict: run.VerdictCheckedButUnverified})
+			if claim != nil {
+				gapUnverified++
+			}
 			continue
 		}
 		real := v.Decision && v.Confidence >= AdjudicateThreshold
+		// outcome is what the claim metric classifies: confirmed, rejected, or unverified.
+		// An escalation that CONFIRMED the claim rescues it; one that merely kept it for a
+		// human (transport failure, unparseable verdict — VerdictCheckedButUnverified) is
+		// unverified, never confirmed: "confirmed_without_evidence" is the metric's
+		// verified-absent, and an infrastructure failure is not a verification.
+		outcome := "rejected"
 		if real {
 			desc, _ := run.CapText(cand.IssueText, run.MaxDesc)
 			confirmed = append(confirmed, run.Bug{ID: run.FindingKey(cand.File, cand.IssueText), Desc: desc, File: cand.File, Line: cand.Line, Verdict: run.VerdictRealButUngold, Confidence: v.Confidence})
-		} else if second, ok := e.secondOpinion(ctx, in, cand, &index); ok {
+			outcome = "confirmed"
+		} else if second, ok := e.secondOpinion(ctx, in, cand, &index, claim); ok {
+			if second.Verdict == run.VerdictRealButUngold {
+				outcome = "confirmed"
+			} else {
+				outcome = "unverified"
+			}
 			confirmed = append(confirmed, second)
 		} else {
 			desc, _ := run.CapText(cand.IssueText, run.MaxShort)
 			rejected = append(rejected, run.Bug{ID: run.FindingKey(cand.File, cand.IssueText), Desc: desc, File: cand.File, Line: cand.Line, Verdict: run.VerdictHallucination, Confidence: v.Confidence})
+		}
+		// Classify AFTER the escalation resolves: the metric reports the FINAL outcome —
+		// classifying from the first arm alone would count a rescued gap claim as rejected
+		// while it lands in out.Confirmed.
+		if claim != nil {
+			switch {
+			case outcome == "confirmed" && len(claim.Evidence) == 0:
+				gapConfirmed++
+				gapConfirmedNoEvidence++
+			case outcome == "confirmed":
+				gapConfirmed++
+			case outcome == "rejected" && len(claim.Evidence) > 0:
+				gapRejected++
+				gapRejectedEvidence++
+			case outcome == "rejected":
+				gapRejected++
+			default: // unverified
+				gapUnverified++
+			}
+		}
+	}
+	// The per-run #140 metric, one record event per adjudicate execution: claims made,
+	// evidence found, and the rulings split by whether covering tests were in view. A
+	// regression shows up as claims-made rising or confirmed-without-evidence shrinking.
+	if gapClaims > 0 {
+		data := run.MarshalCanonical(run.RecordData{
+			Name: "claimcheck",
+			Data: run.MarshalCanonical(map[string]any{
+				"class":                      string(claimcheck.ClassTestingGap),
+				"claims":                     gapClaims,
+				"with_evidence":              gapEvidence,
+				"confirmed":                  gapConfirmed,
+				"confirmed_without_evidence": gapConfirmedNoEvidence,
+				"rejected":                   gapRejected,
+				"rejected_with_evidence":     gapRejectedEvidence,
+				"unverified":                 gapUnverified,
+			}),
+		})
+		if aerr := in.Audit(run.Event{Type: run.TypeRecord, Data: data}); aerr != nil {
+			return nil, aerr
 		}
 	}
 	// validity by construction: the pre-flight bounds the size and count, every
@@ -614,7 +720,13 @@ func (e *adjudicateExec) resolve(ctx context.Context, snap run.Snapshot, node *w
 // secondOpinion re-judges one rejected candidate against wider evidence, and reports whether
 // the finding should be kept. It is only consulted for rejections, so it can never turn a
 // confirmation into a rejection - the error escalation exists to prevent.
-func (e *adjudicateExec) secondOpinion(ctx context.Context, in machine.ExecInput, cand run.Finding, index *int) (run.Bug, bool) {
+//
+// A gap claim escalates with the SAME evidence discipline as the first arm: the second
+// opinion sees the covering-test hunks and the disclosure (ContextForGapClaim), and its
+// audit row carries the claim class. Without that, a claim correctly rejected because the
+// injected tests contradicted it could be flipped back by a judge who never saw them - the
+// cal.com failure mode arriving through the escalation door.
+func (e *adjudicateExec) secondOpinion(ctx context.Context, in machine.ExecInput, cand run.Finding, index *int, claim *judge.ClaimInfo) (run.Bug, bool) {
 	// The trigger deliberately does NOT filter on the diff. A finding that contradicts an
 	// UNCHANGED file - "the code requires eight lenses, these documents still say five" - is
 	// exactly the cross-file case a second opinion settles, and filtering on the diff would
@@ -632,8 +744,15 @@ func (e *adjudicateExec) secondOpinion(ctx context.Context, in machine.ExecInput
 		// The second opinion could not be built, so nothing decided this finding.
 		return run.Bug{ID: run.FindingKey(cand.File, cand.IssueText), Desc: desc, File: cand.File, Line: cand.Line, Verdict: run.VerdictCheckedButUnverified}, true
 	}
-	diff, truncated, diffHash := judge.ContextForClaim(in.Diff.Text, in.Diff.Truncated, cand.File, cand.Line, cand.IssueText, judge.MaxDiffBytes)
-	v, err := callAs(ctx, esc.Judge, in, judge.Request{Kind: judge.KindAdjudicate, Index: *index, Input: judge.AdjudicateInput{Diff: diff, DiffTruncated: truncated, DiffContextHash: diffHash, Candidate: cand, Sandbox: esc.Root != ""}}, esc)
+	var diff string
+	var truncated bool
+	var diffHash string
+	if claim != nil {
+		diff, truncated, diffHash, _ = judge.ContextForGapClaim(in.Diff.Text, in.Diff.Truncated, cand, judge.MaxDiffBytes)
+	} else {
+		diff, truncated, diffHash = judge.ContextForClaim(in.Diff.Text, in.Diff.Truncated, cand.File, cand.Line, cand.IssueText, judge.MaxDiffBytes)
+	}
+	v, err := callAs(ctx, esc.Judge, in, judge.Request{Kind: judge.KindAdjudicate, Index: *index, Input: judge.AdjudicateInput{Diff: diff, DiffTruncated: truncated, DiffContextHash: diffHash, Candidate: cand, Sandbox: esc.Root != ""}, Claim: claim}, esc)
 	*index++
 	if err != nil {
 		// The second opinion never arrived, so nothing decided this finding. Keeping the
