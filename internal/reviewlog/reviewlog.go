@@ -310,15 +310,20 @@ func verdictIsUnresolved(verdict string) bool {
 // same keys. It is used to RECOGNISE a current declaration (knownRubric) and as the source a new
 // frozen era snapshot is cut from — it is NOT what any era points at.
 //
-// EVERY era points at a FROZEN literal, never at currentLenses: v09Lenses (the nine required from
-// 2026-08-31), v08Lenses (the eight from 2026-08-24), legacyLenses (the five before security). A
+// EVERY era points at a FROZEN literal, never at currentLenses: v10Lenses (the ten required from
+// 2026-09-09 — the first full day after the 2026-09-08 merge; see the lensEras comment for why the
+// era is keyed to the day after the merge), v09Lenses (the nine from 2026-08-31), v08Lenses (the eight from 2026-08-24),
+// legacyLenses (the five before security). A
 // historical era's required set must never change when lens.All grows, or completed logs of that
 // era would retroactively become incomplete — the exact failure the era table exists to prevent.
 // Pointing the newest era at the live currentLenses was a latent footgun (flagged in review): a
 // one-line add to lens.All would silently expand what every 2026-08-31+ log had to cover. Adding a
-// lens now requires cutting a new frozen vNLenses snapshot and appending an era for its ship date;
+// lens now requires cutting a new frozen vNLenses snapshot and appending an era keyed from the
+// first FULL day it is required (the day after it merges — see the lensEras comment for why the
+// merge date itself must not be used);
 // TestLensErasAreKeyedByDate pins each era against its frozen literal so skipping that step fails.
 var currentLenses = currentLensKeys()
+var v10Lenses = []string{"feasibility", "completeness", "scopeandalignment", "architecture", "intentpreservation", "security", "testingquality", "datamigration", "runtimereliability", "mechanicalprecision"}
 var v09Lenses = []string{"feasibility", "completeness", "scopeandalignment", "architecture", "intentpreservation", "security", "testingquality", "datamigration", "mechanicalprecision"}
 var v08Lenses = []string{"feasibility", "completeness", "scopeandalignment", "architecture", "intentpreservation", "security", "testingquality", "datamigration"}
 var legacyLenses = []string{"feasibility", "completeness", "scopeandalignment", "architecture", "intentpreservation"}
@@ -341,7 +346,15 @@ func currentLensKeys() []string {
 //
 // Eras are ordered oldest first and compared as YYYYMMDD strings. Security (0.7.0) and
 // testing-quality / data-migration (0.8.0) both shipped on 2026-08-24; mechanical-precision
-// (0.9.0) shipped on 2026-08-31.
+// (0.9.0) shipped on 2026-08-31; runtime-reliability (the benchmark-driven lens upgrade,
+// handoff 2026-09-08) merged on 2026-09-08 but its era is keyed from 2026-09-09 — the first
+// FULL day it is required — because eras are day-granular with no merge-time ordering: keying
+// from the merge date itself would retroactively judge every nine-lens review written earlier
+// that same day (this repository's own mrv-20260908-053049…-artifact-changelog log, and any
+// downstream user's) against the ten-lens set and mark it incomplete — the exact failure the
+// era table exists to prevent. The cost is a sub-day window where the era floor still reads
+// nine, which cannot under-clear a real review: from the moment this merges, the scaffold
+// itself requires ten reviewer rows, so no compliant review can under-declare in it.
 type lensEra struct {
 	from   string
 	lenses []string
@@ -351,6 +364,7 @@ var lensEras = []lensEra{
 	{from: "", lenses: legacyLenses},
 	{from: "20260824", lenses: v08Lenses},
 	{from: "20260831", lenses: v09Lenses},
+	{from: "20260909", lenses: v10Lenses},
 }
 
 // eraLenses is the rubric in force when this run happened. A run ID with no parseable date is
@@ -424,7 +438,7 @@ func runDate(runID string) string {
 
 // knownRubric returns the shipped lens set the declaration names, or nil when it names none.
 func knownRubric(declared []string) []string {
-	for _, rubric := range [][]string{currentLenses, v09Lenses, v08Lenses, legacyLenses} {
+	for _, rubric := range [][]string{currentLenses, v10Lenses, v09Lenses, v08Lenses, legacyLenses} {
 		if sameLensSet(declared, rubric) {
 			return rubric
 		}

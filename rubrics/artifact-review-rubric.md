@@ -55,18 +55,28 @@ scope items to the owning lens instead of double-reporting. Borrowed from Compou
 persona-anti-overlap pattern.
 
 - Feasibility does NOT flag completeness of requirements or scope drift.
-- Completeness does NOT flag feasibility of paths or architecture soundness.
+- Completeness does NOT flag feasibility of paths or architecture soundness, or concrete runtime
+  error-path handling in this diff's code (defer to Runtime-reliability).
 - Scope and alignment does NOT flag completeness or architecture soundness.
 - Architecture does NOT flag security vulnerabilities (defer to Security), test quality (defer to
-  Testing-quality), or migration safety (defer to Data-migration).
+  Testing-quality), migration safety (defer to Data-migration), or concrete runtime error-path
+  handling in this diff's code (defer to Runtime-reliability — design-level failure *propagation
+  shape* stays here).
 - Intent preservation does NOT flag feasibility, completeness, scope, or architecture soundness.
-- Security does NOT flag code style, architecture correctness, test quality, or migration
-  safety.
-- Testing-quality does NOT flag security vulns, architecture soundness, or migration safety.
-- Data-migration does NOT flag security vulns, test quality, or architecture soundness.
+- Security does NOT flag code style, architecture correctness, test quality, migration
+  safety, or runtime error-path handling that is not itself a vulnerability (defer to
+  Runtime-reliability).
+- Testing-quality does NOT flag security vulns, architecture soundness, migration safety, or
+  runtime error-path defects in production code (defer to Runtime-reliability — whether the
+  error paths are *tested* stays here).
+- Data-migration does NOT flag security vulns, test quality, architecture soundness, or runtime
+  error-path handling outside the migration itself (defer to Runtime-reliability).
 - Mechanical-precision does NOT flag whether the approach is sound (defer to Feasibility),
   whether the model is well-designed (defer to Architecture), or missing requirements (defer to
   Completeness); it flags only contracts that are present but not buildable exactly as written.
+- Runtime-reliability does NOT flag security vulnerabilities (defer to Security), test quality
+  (defer to Testing-quality), migration safety (defer to Data-migration), or design-level
+  failure propagation shape and schema invariants (defer to Architecture).
 
 ## Required Lenses
 
@@ -98,7 +108,8 @@ persona-anti-overlap pattern.
   by a test in the same diff is a fabricated finding, the largest single hallucination mode
   in evaluation to date.
 - Does NOT flag: whether a path is feasible (defer to Feasibility); scope drift (defer to Scope
-  and alignment); architecture soundness (defer to Architecture).
+  and alignment); architecture soundness (defer to Architecture); concrete runtime error-path
+  handling in this diff's code (defer to Runtime-reliability).
 
 ### Scope And Alignment
 
@@ -188,11 +199,12 @@ persona-anti-overlap pattern.
   format drift that defeats a security control (a bypassable blacklist) is Security's.
 - Hunt for **cascading-failure paths**: trace the failure propagation — when one dependency
   fails, does the design degrade gracefully or cascade? A sync call chain with no
-  timeout/circuit-breaker/fallback; an async chain with no rejection handling (`.then` without
-  `.catch`, an inner promise not returned so the caller sees success before the refresh
-  completes, optimistic state mutated before the request resolves, out-of-order async responses
-  overwriting newer state); a queue consumer whose failure poisons the batch; a shared
-  resource (cache, connection pool) whose exhaustion takes down all tenants.
+  timeout/circuit-breaker/fallback; an async chain with no rejection handling at the design
+  level (the concrete error-path handling in this diff's code — `.then` without `.catch`,
+  unreturned inner promises, optimistic state mutated before resolution, out-of-order
+  responses overwriting newer state — is Runtime-reliability's); a queue consumer whose
+  failure poisons the batch; a shared resource (cache, connection pool) whose exhaustion
+  takes down all tenants.
 - Hunt for **stand-in-guard-fidelity**: a CI gate, check, or test that can go green while
   production is red — a guard that tests a proxy/mock instead of the real code path; a check
   that passes because the production-only branch is `#ifdef`-ed out or feature-flagged away; a
@@ -216,7 +228,9 @@ persona-anti-overlap pattern.
   disagree on canonical form, an implementer left on a changed interface's old signature, an
   advertised route with no action behind it, or an unversioned breaking API-contract change.
 - Does NOT flag: security vulnerabilities (defer to Security); test quality (defer to
-  Testing-quality); migration safety (defer to Data-migration).
+  Testing-quality); migration safety (defer to Data-migration); concrete runtime error-path
+  handling in this diff's code (defer to Runtime-reliability — design-level failure
+  *propagation shape* stays here).
 
 ### Intent Preservation
 
@@ -264,7 +278,8 @@ persona-anti-overlap pattern.
   issues the deterministic gates already catch (the `eval(` gate covers bare `eval(` injection;
   flag injection the gate does not catch, e.g. SQL string interpolation).
 - Does NOT flag: code style; architecture correctness (defer to Architecture); test quality
-  (defer to Testing-quality); migration safety (defer to Data-migration).
+  (defer to Testing-quality); migration safety (defer to Data-migration); runtime error-path
+  handling that is not itself a vulnerability (defer to Runtime-reliability).
 
 ### Testing-Quality
 
@@ -300,8 +315,10 @@ persona-anti-overlap pattern.
   Completeness; a test that exists but doesn't verify the new behavior -> Testing-quality
   (qualitative). Do not re-report a finding another lens or gate already caught.
 - Does NOT flag: security vulnerabilities (defer to Security); architecture soundness (defer to
-  Architecture); migration safety (defer to Data-migration); whether tests exist at all when no
-  test code is in the diff (defer to Completeness for "missing verification").
+  Architecture); migration safety (defer to Data-migration); runtime error-path defects in
+  production code (defer to Runtime-reliability — whether the error paths are *tested* stays
+  here); whether tests exist at all when no test code is in the diff (defer to Completeness
+  for "missing verification").
 
 ### Data-Migration
 
@@ -347,7 +364,53 @@ persona-anti-overlap pattern.
   transformation that derives an output field from the wrong source or at the wrong
   precision.
 - Does NOT flag: security vulnerabilities (defer to Security); test quality (defer to
-  Testing-quality); architecture soundness beyond migration safety (defer to Architecture).
+  Testing-quality); architecture soundness beyond migration safety (defer to Architecture);
+  runtime error-path handling outside the migration itself (defer to Runtime-reliability).
+
+### Runtime-Reliability
+
+- Attack the assumption that every runtime failure path in this diff is handled, observable,
+  and honest. Find the failure that is silently swallowed, silently partial, or reported as
+  success.
+- Hunt for **unhandled async failure**: a promise/future with no rejection handler
+  (`.then` without `.catch`); an inner async call not returned/awaited so the caller
+  resolves success before the work completes; a fire-and-forget refresh whose failure
+  leaves stale state with no error surfaced to the user.
+- Hunt for **optimistic-state desync**: UI/persistent state mutated before the operation
+  resolves with no rollback on failure; no in-flight guard so concurrent invocations
+  interleave (double-click issues overlapping requests; out-of-order responses overwrite
+  newer state — last response wins); pagination/offset bookkeeping committed before the
+  request succeeds.
+- Hunt for **silent partial success**: work skipped or dropped while the API returns
+  success (unknown IDs silently skipped; an unresolvable dependency silently skipped with
+  no log and no error result; a throttle/lock/dedup key committed before the operation
+  succeeds so retries no-op "successfully"; a hash/cursor advanced even when the underlying
+  write failed).
+- Hunt for **outbound-call hardening**: no timeout on network/file fetches (`open(url)`,
+  `fetch`, feed/HTTP clients); unbounded request payloads or downloads (no size/count cap,
+  no `max()` on schema fields written to storage); request amplification with no rate
+  limit (an enqueue endpoint throttled per-URL, bypassed by varying the path). The
+  reliability hardening here is timeouts, payload/storage caps, and exhaustion on the
+  request path; a missing rate limit that is a vulnerability (unauthenticated
+  amplification) is Security's A04, not this hunt.
+- Hunt for **error-shape leakage**: a raw exception/500 where the API contract promises a
+  4xx (unguarded parse/decrypt, `find`-or-throw on optional relations, missing param
+  envelope); error messages that can never render (a template-literal fallback that is
+  always truthy). Stack traces or error details exposed to end users are Security's A05,
+  not this hunt — this hunt owns the wrong-shape response and the never-rendering
+  message.
+- Hunt for **cross-boundary credential/token lifecycle**: a response schema that cannot
+  structurally satisfy the parser on one path (every refresh fails); a connection/client
+  rebuilt from the pre-refresh token after persisting the new one; `response.ok`/status
+  never checked before parsing.
+- Block on a user-facing operation whose failure is invisible, an API that reports success
+  while dropping work, an unbounded or timeout-less outbound call on a request path, or a
+  raw 500 where a 4xx belongs.
+- Does NOT flag: security vulnerabilities (defer to Security); test quality (defer to
+  Testing-quality); migration safety, including runtime error paths inside the migration
+  itself (defer to Data-migration); design-level failure
+  propagation shape or schema invariants (defer to Architecture); whether error handling
+  is *tested* (defer to Testing-quality).
 
 ### Mechanical-Precision
 

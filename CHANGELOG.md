@@ -4,6 +4,42 @@
 
 ### Added
 
+- **Runtime-reliability lens (10th required artifact-review lens, benchmark-driven).** Artifact
+  review now runs a tenth lens that attacks the assumption that every runtime failure path in the
+  diff is handled, observable, and honest. It owns the finding classes the harnesseval
+  head-to-head vs. Compound Engineering showed metareview's lens taxonomy structurally missing
+  (~90 of 241 CE-only confirmed findings across three clusters): **unhandled async failure**
+  (`.then` without `.catch`, unreturned inner promises, fire-and-forget refreshes — the
+  model-independent `destroyRecord` blind spot was CE-only across 6 different models),
+  **optimistic-state desync** (state mutated before the request resolves, no in-flight guard,
+  out-of-order responses, offset bookkeeping committed early), **silent partial success** (work
+  skipped while the API returns success — unknown IDs dropped, throttle keys committed before the
+  operation succeeds), **outbound-call hardening** (no timeout on `open(url)`/`fetch`, unbounded
+  payloads, missing rate limits), **error-shape leakage** (a raw 500 where the contract promises a
+  4xx), and **cross-boundary credential/token lifecycle** (a sync-mode response that can never
+  satisfy the provider's refresh schema; a client rebuilt from the pre-refresh token). The lens
+  set is still enumerated once in `internal/lens`; the lens-era table freezes the prior nine-lens
+  rubric at its 2026-08-31 date so reviews written before this addition stay judged against the
+  nine they were required to cover. Because eras are day-granular with no merge-time ordering,
+  the ten-lens era is keyed from 2026-09-09 — the first full day the lens is required — not the
+  2026-09-08 merge date: keying from the merge date would retroactively judge every nine-lens
+  review written earlier that same day (this repository's own 2026-09-08-dated artifact review
+  of `CHANGELOG.md`, and any downstream user's) against the ten-lens set and mark it incomplete,
+  the exact retroactive-blocker failure the era table exists to prevent; from the moment this
+  merges the scaffold itself requires ten reviewer rows, so no compliant review can
+  under-declare in the sub-day window. The user-facing lens enumeration was synced nine→ten in
+  `skills/review-artifact/SKILL.md`, `commands/review-artifact.md`, `README.md`, `USAGE.md`,
+  `docs/quickstart.md`, `docs/README.claude.md`, `docs/README.codex.md`, and the
+  `docs/fsm/sdlc-loop-example.md` payload, pinned by `tests/manifest/test-skills.sh` (which now
+  also covers `USAGE.md`'s "adversarial lenses" count form and the example's prose, not just
+  its numeric payload). Anti-overlap: Architecture keeps design-level failure
+  *propagation shape* (its cascading-failure/sentinel hunts); Runtime-reliability owns concrete
+  error-path handling in this diff's code. Security, Testing-quality, Data-migration, and
+  Completeness's "does NOT flag" lines now defer runtime error-path findings here. Deliberately
+  NOT added (handoff §4): style/deprecation/dedup hunting — 5 of 10 external-reviewer misses live
+  there and suppressing them is precision working as designed — and no separate api-contract
+  lens (Architecture's hunt was broadened instead).
+
 - **Testing-gap claims are now verified against the repository head, not just the diff (issue #146).**
   The #140 mechanism (PR #145) only searched covering-test evidence among added diff lines, so a
   covering test outside every changed hunk was invisible and a false absence claim could be confirmed.
@@ -101,7 +137,8 @@
   freezes the prior eight-lens rubric at its 2026-08-24 date, so reviews written before this
   addition stay judged against the eight they were required to cover. The FSM `sdlc-loop` and
   `review-loop` discover node no longer hard-codes a lens count: it defaults to the full
-  `kind.Lenses` set (now nine) and auto-tracks any lens added later, guarded by a test that
+  `kind.Lenses` set (nine at the time; the Runtime-reliability entry above makes it ten) and
+  auto-tracks any lens added later, guarded by a test that
   refuses a re-introduced `lenses:` cap.
 
 - **Mutation reports as review input (`--mutation-report`).** `review task-done`, `review
