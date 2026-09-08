@@ -10,6 +10,10 @@ Execution mode: `parallel-subagents`
 
 Previous run: `none`
 
+Head: `1ae159949c4db4ca3771bd6b1a96b9479df4d439`
+
+Covered paths: `[".handoffs/handoff-2026-09-08-lens-upgrade-followups.md"]`
+
 Required lenses: `feasibility, completeness, scope-alignment, architecture, intent-preservation, security, testing-quality, data-migration, runtime-reliability, mechanical-precision`
 
 ## Verdict
