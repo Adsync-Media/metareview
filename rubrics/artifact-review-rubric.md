@@ -84,7 +84,13 @@ persona-anti-overlap pattern.
 - Attack the assumption that the artifact covers every requirement. Find the requirement this
   artifact silently drops — the missing acceptance criterion, the missing verification, the
   obvious edge case no section addresses.
-- Block on missing acceptance criteria, missing verification, or unhandled obvious edge cases.
+- Hunt for **sibling-flag propagation**: when the diff touches a
+  notification/rendering/serialization path gated by user-config flags, enumerate ALL
+  gating flags (`disable*`, `hide*`, `include*`) and check each one — catching
+  `disableStandardEmails` but missing `hideCalendarNotes` on the same path is a miss.
+- Block on missing acceptance criteria, missing verification, unhandled obvious edge cases,
+  or a gating flag on a touched notification/rendering/serialization path left unchecked
+  (the sibling-flag miss).
 - Any finding that claims tests, specs or verification are ABSENT must first search for what it
   claims is missing — the diff's test-shaped files (`spec/**`, `specs/**`, `test/**`, `tests/**`,
   `__tests__/**`, `*.test.*`, `*.spec.*`, `*_test.go`, `test_*.py`) and the repo, with your
@@ -170,9 +176,22 @@ persona-anti-overlap pattern.
 - Hunt for **sentinel-meaning-change**: a return value that changed meaning in this diff — a
   `null`/empty/`[]` that previously meant "nothing here" now meaning "not yet loaded" or "error
   suppressed"; a status sentinel whose semantics shifted so existing callers now misbehave.
+- Hunt for **format-drift** (the value one path writes and another path compares disagree
+  on canonical form): case (`lower(host) = ?` column vs raw user input; a column stored
+  lowercased but matched against mixed-case input); scheme (`http://`-prefixed hosts stored,
+  bare `URI#host` compared); port (validation accepts `host:8080`, lookup via `URI#host`
+  strips it); trailing-slash concatenation; type coercion (JSON boolean vs string
+  `"true"`, array vs CSV string); encoding (double-decode); normalization asymmetry (model
+  callbacks normalize new rows, but a raw-SQL insert or other non-migration path bypasses
+  them — a migration's own backfill safety is Data-migration's, not this hunt's). The
+  correctness failure this hunt owns is the lookup that fails to match what was stored; a
+  format drift that defeats a security control (a bypassable blacklist) is Security's.
 - Hunt for **cascading-failure paths**: trace the failure propagation — when one dependency
   fails, does the design degrade gracefully or cascade? A sync call chain with no
-  timeout/circuit-breaker/fallback; a queue consumer whose failure poisons the batch; a shared
+  timeout/circuit-breaker/fallback; an async chain with no rejection handling (`.then` without
+  `.catch`, an inner promise not returned so the caller sees success before the refresh
+  completes, optimistic state mutated before the request resolves, out-of-order async responses
+  overwriting newer state); a queue consumer whose failure poisons the batch; a shared
   resource (cache, connection pool) whose exhaustion takes down all tenants.
 - Hunt for **stand-in-guard-fidelity**: a CI gate, check, or test that can go green while
   production is red — a guard that tests a proxy/mock instead of the real code path; a check
@@ -181,14 +200,21 @@ persona-anti-overlap pattern.
 - Hunt for **api-contract breaking changes**: renamed or removed fields, narrowed inputs,
   widened returns, missing versioning on breaking changes; a response shape that existing
   callers depend on but the diff silently changes; a field re-typed (int→string) with no
-  version bump.
+  version bump; and when a diff changes an interface/abstract-method signature, check EVERY
+  implementer, not just the call sites in the diff (an implementer left on the old signature
+  compiles against duck-typing and silently misroutes, e.g. always hitting the default
+  calendar path); advertised routes with no controller action; an accepted request envelope
+  changed or dropped so existing callers send fields that are silently ignored; strict-equality
+  param parsing that silently inverts booleans (`params[:visible] == "true"` vs JSON `true`).
 - Block on parallel service paths, contradictions with existing architecture, O(n^2) over a
   growing collection, unbounded materialization on a hot path, N+1 query loops, derivable data
   stored without invalidation, an illegal state the schema permits (no `CHECK` forbidding it),
   an unguarded state transition, a lost-update on a balance/counter, money as float, a
   phantom-maintained derived column, a sentinel-meaning-change with no caller update, a
   cascading-failure path with no degradation, a stand-in guard that can go green while prod is
-  red, or an unversioned breaking API-contract change.
+  red, a format-drift where the path that writes a value and the path that compares it
+  disagree on canonical form, an implementer left on a changed interface's old signature, an
+  advertised route with no action behind it, or an unversioned breaking API-contract change.
 - Does NOT flag: security vulnerabilities (defer to Security); test quality (defer to
   Testing-quality); migration safety (defer to Data-migration).
 
@@ -218,13 +244,23 @@ persona-anti-overlap pattern.
 - Hunt for **SSRF protocol-bypass**: server-side fetch of unvalidated user URLs where a naive
   localhost string check (`url.includes('localhost')`) is defeated by `file://`, `gopher://`,
   `127.0.0.1` in decimal/IPv6 notation, or DNS rebinding.
+- Hunt for **normalization-mismatch bypasses of security controls**: a control
+  (allowlist/blacklist, deny rule, host check) compared in one canonical form against input
+  arriving in another — a lowercased blacklist checked against non-lowercased input, an
+  allowlist normalized on a different scheme or case, a deny rule defeated by a
+  double-decode (a URL host/scheme check bypassed by protocol forms — `file://`, decimal
+  IPs, DNS rebinding — is the SSRF protocol-bypass hunt's, above). The correctness half of
+  the same drift (a lookup that fails to match what was stored) is Architecture's
+  format-drift hunt, not this one.
 - Hunt for **secrets in logs** (distinct from secrets in code): PII, tokens, or credentials
   written to log output, error messages, or telemetry — not hardcoded in source, but leaked at
   runtime through logging paths the diff adds or changes.
 - Block on user-supplied-id lookups without ownership scope, string-interpolated SQL/commands,
   unvalidated deserialization of untrusted input, hardcoded secrets in committed code, secrets
   written to logs, server-side fetch of unvalidated user URLs (including protocol-bypass),
-  unescaped user input to HTML/JS output, weakened token integrity/entropy. Do not double-report
+  unescaped user input to HTML/JS output, weakened token integrity/entropy, or a
+  normalization-mismatch bypass of a security control (a lowercased blacklist checked
+  against non-lowercased input). Do not double-report
   issues the deterministic gates already catch (the `eval(` gate covers bare `eval(` injection;
   flag injection the gate does not catch, e.g. SQL string interpolation).
 - Does NOT flag: code style; architecture correctness (defer to Architecture); test quality
@@ -290,8 +326,26 @@ persona-anti-overlap pattern.
 - Hunt for **silent data loss**: a migration that drops, overwrites, or truncates data without a
   backup/export step; a `DELETE` with a broader `WHERE` than intended; a column repurposed
   (same name, new meaning) so old data is silently misinterpreted.
+- Hunt for **migration re-run safety**: `force: true` added to an already-shipped migration
+  (drops pre-existing tables on re-run); a conditional insert paired with an unconditional
+  delete (settings destroyed even when no rows were migrated); dead guards on query results
+  (`cmd_tuples > 0` is always 0 for SELECTs in PostgreSQL — the guarded insert never runs,
+  so the paired delete destroys the old rows with no replacement created); backfills that
+  bypass model validations/callbacks (whitespace/junk rows;
+  values interpolated into backfill SQL without the escaping/parameterization the model
+  layer would have applied — the data-integrity failure is this lens's, the injection angle
+  is Security's); enum/boolean defaults that silently reclassify every
+  existing row (`cook_method` default 1 = `raw_html`); transformation field-fidelity (each
+  output field must derive from the right source at the right precision — `raw` vs
+  `cooked`, date vs datetime, precision loss on parse).
 - Block on irreversible migrations without rollback, missing backfills for NOT NULL columns,
-  expand+contract violations that break rolling deploys, silent data loss, or orphaned refs.
+  expand+contract violations that break rolling deploys, silent data loss, orphaned refs, a
+  shipped migration made destructive on re-run (`force: true`), a conditional insert paired
+  with an unconditional delete (data destroyed even when nothing was migrated), a dead guard
+  that leaves a delete unreplaced (no replacement rows created), an enum/boolean default that
+  silently reclassifies existing rows, a backfill that bypasses validations, or a
+  transformation that derives an output field from the wrong source or at the wrong
+  precision.
 - Does NOT flag: security vulnerabilities (defer to Security); test quality (defer to
   Testing-quality); architecture soundness beyond migration safety (defer to Architecture).
 
