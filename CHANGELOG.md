@@ -18,6 +18,14 @@
   a gap claim is confirmable. `cmd/claimcheck-eval -repos <dir>` adds the repo-side structural pass
   over the harnesseval corpus (combined diff×repo matrix, no-clone/repo-error rows disclosed); the
   A/B re-judge against the v2 ground truth needs model spend and stays open in the issue.
+- **`cmd/claimcheck-ab`, the A/B re-judge driver for #146.** Re-judges the harnesseval gap-claim
+  corpus twice with one judge model — arm A replays the #145-era prompt (diff-only context, the
+  pre-#146 `RubricAddendum` verbatim from git history), arm B runs the production render (repo-side
+  evidence + the current criterion) — and scores both arms against the v2 three-way ground truth
+  (`readjudication3.json`), reporting per-arm hallucinated-confirm (false accepts), true-gap
+  regression, and flip counts. Corpus PRs pin locally as per-PR refs (`refs/heads/pr-<N>`), repo
+  evidence is cached per claim under `<out>/evidence/`, and `results.jsonl` is append-only and
+  resumable, so the run survives interruption and repeats cost only the un-judged pairs.
 
 ### Changed
 
