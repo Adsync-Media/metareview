@@ -258,7 +258,13 @@ func readLines(path string) []string {
 	if err != nil {
 		return nil
 	}
-	return strings.Split(string(data), "\n")
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
 }
 
 // appendMu serializes result-row appends: each write is a single O_APPEND write call

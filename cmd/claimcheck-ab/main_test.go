@@ -112,6 +112,9 @@ func buildLab(t *testing.T) (lab, repos string) {
 	origin := filepath.Join(t.TempDir(), "origin")
 	initRepo(t, origin, map[string]string{
 		"app/models/topic_embed.rb": "def embed(x); x; end\n",
+		// git grep matches content, not paths, so the covering test must name its subject
+		// in the body for the seam to recall it.
+		"spec/models/topic_embed_spec.rb": "require 'rails_helper'\n# exercises topic_embed end to end\n",
 	})
 	if out, err := exec.Command("git", "-C", origin, "rev-parse", "HEAD").Output(); err != nil {
 		t.Fatal(err)
@@ -406,7 +409,7 @@ func TestJudgeOneArms(t *testing.T) {
 	// error path: the endpoint is gone
 	srv.Close()
 	res := judgeOne(e, rp, "a", c)
-	if res.Verdict != "error" || res.Error == "" || !strings.HasSuffix(res.Key, "|a") {
+	if res.Verdict != "error" || res.Error == "" || res.Key != claimKey(url1, gapText) {
 		t.Errorf("error row = %+v", res)
 	}
 }
@@ -425,7 +428,7 @@ func systemFor(t *testing.T, raw, url, arm string) string {
 		if json.Unmarshal([]byte(line), &req) != nil {
 			continue
 		}
-		if len(req.Messages) == 2 && strings.Contains(req.Messages[1].Content, url) && strings.Contains(req.Messages[1].Content, armMarker(arm)) {
+		if len(req.Messages) == 2 && strings.Contains(req.Messages[1].Content, gapText) && strings.Contains(req.Messages[0].Content, armMarker(arm)) {
 			return req.Messages[0].Content
 		}
 	}
@@ -487,8 +490,8 @@ func TestReportMatrix(t *testing.T) {
 func TestAppendReadHelpers(t *testing.T) {
 	out := t.TempDir()
 	appendResult(out, &result{Key: "k", Arm: "a", Verdict: "confirmed"})
-	if lines := readLines(filepath.Join(out, "results.jsonl")); len(lines) != 1 {
-		t.Errorf("readLines = %d lines, want 1", len(lines))
+	if lines := readLines(filepath.Join(out, "results.jsonl")); len(lines) != 1 || !strings.Contains(lines[0], "confirmed") {
+		t.Errorf("readLines = %q, want the single row (a trailing newline is not a row)", lines)
 	}
 	if readLines(filepath.Join(out, "nope")) != nil {
 		t.Error("missing file must read as nil")
