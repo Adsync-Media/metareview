@@ -1,6 +1,6 @@
 # metareview Findings
 
-No unresolved findings recorded yet.
+- mrvf-20260908-060804291514000-task-done-kind-b7bb121c-001 [high] No adjudicated lens review recorded (adversarial-review-reviewer)
 
 ## Process Overrides
 
