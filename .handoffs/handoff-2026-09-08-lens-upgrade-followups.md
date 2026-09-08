@@ -30,17 +30,36 @@ Everything the runs need is in place: the merged rubrics, the synced adapter
 adjudicator (`readjudicate3.py` v3: cross-run dedup, grounded hallucination, k=3 majority,
 provenance stripping, `--second-pass`).
 
-**What to run** (per parent §5.2, minimum): mrv × glm-5.3 × low and × high (xhigh rung) on
-the top-6 PRs, per `~/Developer/harnesseval/REPRODUCE.md` and the batch tracking in
-`results/`. Judge/model access: `~/.config/harnesseval/keys.env` (HARNESS_LUNAROUTE_API_KEY
-+ LUNAROUTE_BASE_URL for GLM; never print them). Point the adapter at a binary built from
-CURRENT main via `HARNESS_MRV_BIN`.
+**What to run** (per parent §5.2, minimum): mrv × **glm-5.3-background** (the
+model-under-test ID — do not confuse it with glm-5.3-flash, which is the JUDGE) × low and ×
+high (xhigh rung) on the top-6 PRs, per `~/Developer/harnesseval/REPRODUCE.md` and the batch
+tracking in `results/`. Point the adapter at a binary built from CURRENT main via
+`HARNESS_MRV_BIN`.
+
+**Keys** (`~/.config/harnesseval/keys.env`): the harness loads the file itself via
+`harnesseval/keys.py` (HARNESS_LUNAROUTE_API_KEY + LUNAROUTE_BASE_URL) — do NOT export the
+values into the shell or profile: the HARNESS_ prefix exists precisely so they can never
+collide with the env-var names the CLIs watch (ANTHROPIC_API_KEY / OPENAI_API_KEY override
+Claude Code / Codex OAuth when set). Never print them. For metareview's own FSM dogfood
+judge (a separate concern), the session precedent passed OPENAI_BASE_URL (lunaroute host,
+path stripped) + OPENAI_API_KEY inline per-command, never exported.
 
 **Acceptance** (parent §5.3): the 8 named previously-missed findings, ≥6/8 caught in a
 glm-low run, no golden-recall regression >2 points (baselines in parent §7:
 GLM low rec 0.66–0.83 / hidden gold 24–25 per PR; high 0.67–0.74 / 26–33; CE 35–36 low,
-39–46 high). The 8 findings are listed in parent §5.3; all are in `analysis/ce_only.json`
-(read-only — do not modify anything under `analysis/`).
+39–46 high). The 8 findings are listed in parent §5.3 with their sources: findings 1–7 are
+in `analysis/ce_only.json`; finding 8 (Office365 `updateEvent`/`deleteEvent` vs the
+`Calendar` interface, PR #10967) is from `analysis/EXTERNAL_REVIEWER_GAPS.md` (the
+CodeRabbit cross-check, parent §2.4), NOT ce_only.json. Everything under `analysis/` is
+read-only.
+
+**Hard gate alongside the runs** (parent §5.3's final sentence, easy to lose): Workstream C
+changed `V2_PROMPT` and added `TIEBREAK_PROMPT`, so the adjudicator flip regression suite is
+MANDATORY before trusting any v3-adjudicated numbers: run
+`tools/score_flips.py` (harnesseval repo) against the frozen
+`tests/fixtures/flip_pairs.json` — zero flips on identical text is the hard gate; the
+direction report (how many of the 116 now adjudicate `bug`) needs judge API spend and is
+yield measurement, not a gate.
 
 **Sequencing note**: if any brief text changes again (see §3 below), the adapter must be
 re-synced BEFORE re-measuring — that is why the taxonomy clauses are deliberately queued
@@ -90,7 +109,13 @@ first), or (b) a simpler lint flagging diffs that modify tracked files under
 `docs/metareview/**` which no tool generated in the current session. No decision was made;
 this is the lowest-priority item.
 
-## Deviations from the parent handoff (already landed, recorded here so they are not re-litigated)
+## Deviations from the parent handoff (already landed — flagged here for HUMAN acceptance, not to foreclose re-litigation)
+
+The first deviation below contradicts the parent handoff's explicit §8 instruction; the
+implementing session judged the parent's own invariant to override its letter (reasoning
+recorded with the change), but a human should ratify or reverse it — reversing means
+re-keying the v10 era to 20260831-adjacent merge-date semantics and re-running the affected
+gates, so decide deliberately.
 
 1. **v10 era keyed from 2026-09-09, not the 2026-09-08 merge date.** The parent said "the
    era date must be the merge date of workstream B" (§8), but its own invariant — "older
