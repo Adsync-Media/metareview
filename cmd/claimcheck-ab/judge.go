@@ -64,7 +64,7 @@ func judgeOne(e env, rp *repoPass, arm string, c abClaim) *result {
 	v, err := callJudge(ctx, e, system, user)
 	fmt.Fprintf(os.Stderr, "[judge] %s arm=%s done err=%v\n", claimKey(c.rec.URL, c.rec.IssueText), arm, err)
 	if err != nil {
-		return &result{Key: claimKey(c.rec.URL, c.rec.IssueText) + "|" + arm, URL: c.rec.URL, Arm: arm,
+		return &result{Key: claimKey(c.rec.URL, c.rec.IssueText), URL: c.rec.URL, Arm: arm,
 			IssueText: c.rec.IssueText, V2Verdict: c.rec.NewVerdict, Verdict: "error", Error: err.Error()}
 	}
 	vv := "rejected"

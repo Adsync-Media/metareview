@@ -42,24 +42,6 @@ type repoPass struct {
 
 func (p *repoPass) rev(url string) string { return p.revs[url] }
 
-// grepSeam/showSeam delegate to judge.GrepSeam/ShowSeam — the same seams the
-// production adjudicator runs, so arm B measures the shipped search.
-func (p *repoPass) grepSeam(ctx context.Context, url string) judge.GrepPaths {
-	rev, dir := p.revs[url], p.dirs[url]
-	if rev == "" {
-		return func(string) ([]string, error) { return nil, nil }
-	}
-	return judge.GrepSeam(ctx, runGitRaw, dir, rev)
-}
-
-func (p *repoPass) showSeam(ctx context.Context, url string) judge.ShowHead {
-	rev, dir := p.revs[url], p.dirs[url]
-	if rev == "" {
-		return func(string) ([]byte, bool, error) { return nil, false, nil }
-	}
-	return judge.ShowSeam(ctx, runGitRaw, dir, rev)
-}
-
 func runGitRaw(ctx context.Context, dir string, args ...string) ([]byte, int, error) {
 	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
@@ -151,6 +133,8 @@ func loadCorpus(dir, reposDir string) ([]record, map[string]string, *repoPass) {
 	return records, diffs, rp
 }
 
+// grepSeamFor/showSeamFor delegate to judge.GrepSeam/ShowSeam — the same seams the
+// production adjudicator runs, so arm B measures the shipped search.
 func (p *repoPass) grepSeamFor(url string) judge.GrepPaths {
 	rev, dir := p.revs[url], p.dirs[url]
 	if rev == "" {
@@ -180,5 +164,3 @@ func claimKey(url, issueText string) string {
 	sum := sha1.Sum([]byte(url + "\x00" + issueText))
 	return hex.EncodeToString(sum[:])[:16]
 }
-
-var _ = fmt.Sprintf

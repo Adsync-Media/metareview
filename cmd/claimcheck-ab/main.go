@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,24 +32,34 @@ import (
 	"github.com/dsifry/metareview/internal/fsm/run"
 )
 
-func main() {
+// osExit is main's only exit path, var so a test can capture the code instead of
+// terminating the test process (the claimcheck-eval pattern).
+var osExit = os.Exit
+
+func main() { osExit(realMain()) }
+
+func realMain() int {
+	fs := flag.NewFlagSet("claimcheck-ab", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr) // a flag misuse must say why, not exit 2 into silence
 	var (
-		dir         = flag.String("harnesseval", "../harnesseval", "harnesseval checkout (read-only)")
-		reposDir    = flag.String("repos", "", "directory of corpus clones (<repos>/<org>/<repo>)")
-		model       = flag.String("model", "glm-5.2-vision", "judge model (both arms)")
-		effort      = flag.String("effort", "high", "reasoning effort")
-		outDir      = flag.String("out", "/tmp/claimcheck-ab", "results directory (resumable)")
-		concurrency = flag.Int("concurrency", 6, "parallel judge calls")
-		armsFlag    = flag.String("arms", "a,b", "arms to run: a, b, or a,b")
-		limit       = flag.Int("limit", 0, "stop after N claims (0 = all)")
+		dir         = fs.String("harnesseval", "../harnesseval", "harnesseval checkout (read-only)")
+		reposDir    = fs.String("repos", "", "directory of corpus clones (<repos>/<org>/<repo>)")
+		model       = fs.String("model", "glm-5.2-vision", "judge model (both arms)")
+		effort      = fs.String("effort", "high", "reasoning effort")
+		outDir      = fs.String("out", "/tmp/claimcheck-ab", "results directory (resumable)")
+		concurrency = fs.Int("concurrency", 6, "parallel judge calls")
+		armsFlag    = fs.String("arms", "a,b", "arms to run: a, b, or a,b")
+		limit       = fs.Int("limit", 0, "stop after N claims (0 = all)")
 	)
-	flag.Parse()
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		return 2
+	}
 	if *reposDir == "" {
-		fatal(fmt.Errorf("-repos is required (corpus clones)"))
+		return fatal(fmt.Errorf("-repos is required (corpus clones)"))
 	}
 	key, base := os.Getenv("OPENAI_API_KEY"), os.Getenv("OPENAI_BASE_URL")
 	if key == "" || base == "" {
-		fatal(fmt.Errorf("OPENAI_API_KEY and OPENAI_BASE_URL are required"))
+		return fatal(fmt.Errorf("OPENAI_API_KEY and OPENAI_BASE_URL are required"))
 	}
 	arms := map[string]bool{}
 	for _, a := range strings.Split(*armsFlag, ",") {
@@ -95,7 +106,7 @@ func main() {
 		claims = append(claims, abClaim{rec: rec, find: f, diff: diff, repoEv: repoEv})
 	}
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
-		fatal(err)
+		return fatal(err)
 	}
 	fmt.Printf("gap claims to judge: %d (repo evidence found for %d)\n", len(claims), withRepo)
 
@@ -133,7 +144,8 @@ func main() {
 	}
 	close(jobs)
 	wg.Wait()
-	report(*outDir)
+	report(*outDir, os.Stdout)
+	return 0
 }
 
 // result is one arm's verdict for one claim.
@@ -154,18 +166,19 @@ type result struct {
 // report prints the per-arm confusion matrix against the v2 ground truth and the
 // headline deltas the issue asks about: hallucinated gap-claims confirmed (false
 // accepts — the #140/#146 failure mode) and true gap findings rejected (regressions).
-func report(outDir string) {
+// Rows the lab could not adjudicate (v2 "unresolved") are counted but excluded from
+// both matrices — they are neither false accepts nor regressions.
+func report(outDir string, stdout io.Writer) {
 	data, err := os.ReadFile(filepath.Join(outDir, "results.jsonl"))
 	if err != nil {
 		return
 	}
 	type row struct {
-		arm      string
-		v2       string
-		verdict  string
-		err      string
-		evidence bool
-		issue    string
+		arm     string
+		v2      string
+		verdict string
+		err     string
+		issue   string
 	}
 	perArm := map[string][]row{}
 	for _, line := range strings.Split(string(data), "\n") {
@@ -173,9 +186,9 @@ func report(outDir string) {
 		if json.Unmarshal([]byte(line), &r) != nil {
 			continue
 		}
-		perArm[r.Arm] = append(perArm[r.Arm], row{arm: r.Arm, v2: r.V2Verdict, verdict: r.Verdict, err: r.Error, evidence: len(r.Evidence) > 0, issue: r.IssueText})
+		perArm[r.Arm] = append(perArm[r.Arm], row{arm: r.Arm, v2: r.V2Verdict, verdict: r.Verdict, err: r.Error, issue: r.IssueText})
 	}
-	fmt.Println()
+	fmt.Fprintln(stdout)
 	for _, arm := range []string{"a", "b"} {
 		rows := perArm[arm]
 		if len(rows) == 0 {
@@ -209,10 +222,10 @@ func report(outDir string) {
 				trueErr++
 			}
 		}
-		fmt.Printf("%s\n", title)
-		fmt.Printf("  hallucinated gap-claims: confirmed (FALSE ACCEPTS)=%d rejected=%d errors=%d\n", halConf, halRej, halErr)
-		fmt.Printf("  true gap findings:       confirmed=%d rejected (REGRESSIONS)=%d errors=%d\n", trueConf, trueRej, trueErr)
-		fmt.Printf("  lab-unresolved claims:   %d (excluded from the matrix)\n", unresolved)
+		fmt.Fprintf(stdout, "%s\n", title)
+		fmt.Fprintf(stdout, "  hallucinated gap-claims: confirmed (FALSE ACCEPTS)=%d rejected=%d errors=%d\n", halConf, halRej, halErr)
+		fmt.Fprintf(stdout, "  true gap findings:       confirmed=%d rejected (REGRESSIONS)=%d errors=%d\n", trueConf, trueRej, trueErr)
+		fmt.Fprintf(stdout, "  lab-unresolved claims:   %d (excluded from the matrix)\n", unresolved)
 	}
 	// per-claim paired delta for the claims both arms judged
 	paired := map[string][2]string{}
@@ -232,12 +245,12 @@ func report(outDir string) {
 			flips++
 		}
 	}
-	fmt.Printf("\nclaims judged by both arms: %d; verdict flips between arms: %d\n", len(paired), flips)
+	fmt.Fprintf(stdout, "\nclaims judged by both arms: %d; verdict flips between arms: %d\n", len(paired), flips)
 }
 
-func fatal(err error) {
+func fatal(err error) int {
 	fmt.Fprintln(os.Stderr, "claimcheck-ab:", err)
-	os.Exit(1)
+	return 1
 }
 
 func readLines(path string) []string {
@@ -248,7 +261,14 @@ func readLines(path string) []string {
 	return strings.Split(string(data), "\n")
 }
 
+// appendMu serializes result-row appends: each write is a single O_APPEND write call
+// (atomic on POSIX for these sizes), but the open-append-close cycle must not race
+// with itself or a row can land between another row's open and write.
+var appendMu sync.Mutex
+
 func appendResult(outDir string, r *result) {
+	appendMu.Lock()
+	defer appendMu.Unlock()
 	f, err := os.OpenFile(filepath.Join(outDir, "results.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
