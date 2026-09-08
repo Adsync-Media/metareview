@@ -29,6 +29,13 @@
 
 ### Changed
 
+- **review-lenses instructions now mandate read-only lens subagents (issue #146 follow-up).** While
+  driving the #146 A/B artifact review, a lens subagent with write access to the shared tree decided
+  fixing the artifact was in scope and committed to `main` mid-review. The FSM's review-lenses node
+  instruction now tells the orchestrator to run every lens subagent read-only — no file modification,
+  staging, commits, or state-changing commands, findings only — with the orchestrator owning any
+  changes the findings justify.
+
 - **Coverage gate is now require-100 for the whole repository.** After the repo-wide campaign brought
   every package to 100% statement coverage with zero surviving mutants, the per-package floor
   (`tests/coverage-floor.txt`) and the transitional bash gate (`tests/coverage.sh`, with its
