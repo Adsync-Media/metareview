@@ -23,10 +23,3 @@ github.com/dsifry/metareview/cmd/covergate
 
 # A black-box (external) test-only package — no production statements, never in the coverage profile.
 github.com/dsifry/metareview/internal/githooktest
-
-# A one-off measurement driver for the issue-#146 A/B re-judge (harnesseval gap-claim corpus,
-# old-criterion vs new-criterion arms). Its prompt assembly, evidence search, and seams delegate
-# to internal/fsm/judge and internal/claimcheck, which ARE gated at 100%; the glue (flags, HTTP
-# call, JSONL resume, confusion-matrix report) was validated by a live 20-claim smoke against the
-# real corpus and judge endpoint. A unit test would mock the endpoint it exists to exercise.
-github.com/dsifry/metareview/cmd/claimcheck-ab
