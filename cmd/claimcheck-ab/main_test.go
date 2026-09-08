@@ -73,35 +73,57 @@ func buildLab(t *testing.T) (lab, repos string) {
 			t.Fatal(err)
 		}
 	}
-	// run1: the claim with a cloneable PR, its non-claim sibling, a claim whose diff is
-	// missing, one with a corrupt diff, a claim on a non-GitHub URL, and a duplicate.
-	records := []map[string]any{
-		{"issue_text": gapText, "new_verdict": "bug"},
-		{"issue_text": "nil dereference in the embed path", "new_verdict": "hallucination"},
-		{"issue_text": "zero test coverage for the scheduler", "new_verdict": "important_non_bug"},
-		{"issue_text": "lacks a spec for the retry loop", "new_verdict": "unresolved"},
-		{"issue_text": "nothing asserts the rate limit", "new_verdict": "bug"},
-		{"issue_text": gapText, "new_verdict": "bug"}, // duplicate of the first
+	// One run file per PR URL: the loader stamps each run's top-level url onto every
+	// record it contains (a run is one PR), so per-URL fixtures need per-URL runs.
+	// Covered states: claim with a cloneable PR (+ duplicate claim + non-claim sibling),
+	// claim whose diff is missing, corrupt diff cache, non-GitHub URL, repo dir missing,
+	// repo without the local ref and no remote (fetch fails), repo that pins on fetch.
+	runs := []struct {
+		name, url string
+		records   []map[string]string
+	}{
+		{"run1", "https://github.com/org/repo/pull/1", []map[string]string{
+			{"issue_text": gapText, "new_verdict": "bug"},
+			{"issue_text": "nil dereference in the embed path", "new_verdict": "hallucination"},
+			{"issue_text": gapText, "new_verdict": "bug"}, // duplicate claim → dedup continue
+		}},
+		{"run2", "https://github.com/org/repo/pull/2", []map[string]string{
+			{"issue_text": "zero test coverage for the scheduler", "new_verdict": "important_non_bug"},
+		}},
+		{"run3", "https://github.com/org/repo/pull/3", []map[string]string{
+			{"issue_text": "lacks a spec for the retry loop", "new_verdict": "unresolved"},
+		}},
+		{"run4", "https://example.com/other", []map[string]string{
+			{"issue_text": "nothing asserts the rate limit", "new_verdict": "bug"},
+		}},
+		{"run5", "https://github.com/org3/repo3/pull/8", []map[string]string{
+			{"issue_text": "nothing asserts the export path", "new_verdict": "bug"},
+		}},
+		{"run6", "https://github.com/org2/repo2/pull/4", []map[string]string{
+			{"issue_text": "no test asserts the retry path", "new_verdict": "bug"},
+		}},
+		{"run7", "https://github.com/org4/repo4/pull/9", []map[string]string{
+			{"issue_text": "untested export path", "new_verdict": "bug"},
+		}},
 	}
-	urls := []string{
-		"https://github.com/org/repo/pull/1",
-		"https://github.com/org/repo/pull/1",
-		"https://github.com/org/repo/pull/2", // no cached diff
-		"https://github.com/org/repo/pull/3", // corrupt diff cache
-		"https://example.com/other",          // not a GitHub PR URL
-		"https://github.com/org/repo/pull/1",
+	for _, r := range runs {
+		raw, _ := json.Marshal(map[string]any{"url": r.url, "records": r.records})
+		write(filepath.Join("runs", r.name, "readjudication3.json"), string(raw))
 	}
-	for i := range records {
-		records[i]["url"] = urls[i]
+	// an unreadable run file: a directory where the loader expects a file
+	if err := os.MkdirAll(filepath.Join(lab, "runs", "runbad", "readjudication3.json"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	raw, _ := json.Marshal(map[string]any{"url": urls[0], "records": records})
-	write(filepath.Join("runs", "run1", "readjudication3.json"), string(raw))
-	write(filepath.Join("runs", "run2", "readjudication3.json"), "{not json")
+	// an unparsable run file
+	write(filepath.Join("runs", "runbad2", "readjudication3.json"), "{not json")
 
 	for u, diff := range map[string]string{
-		"https://github.com/org/repo/pull/1": "--- a/app/models/topic_embed.rb\n+++ b/app/models/topic_embed.rb\n@@ -1 +1 @@\n-def embed\n+def embed(x)\n",
-		"https://example.com/other":          "--- a/x.rb\n+++ b/x.rb\n@@ -1 +1 @@\n",
-		"https://github.com/org/repo/pull/3": "{not json",
+		"https://github.com/org/repo/pull/1":   "--- a/app/models/topic_embed.rb\n+++ b/app/models/topic_embed.rb\n@@ -1 +1 @@\n-def embed\n+def embed(x)\n",
+		"https://example.com/other":            "--- a/x.rb\n+++ b/x.rb\n@@ -1 +1 @@\n",
+		"https://github.com/org/repo/pull/3":   "{not json",
+		"https://github.com/org3/repo3/pull/8": "--- a/export.go\n+++ b/export.go\n@@ -1 +1 @@\n",
+		"https://github.com/org2/repo2/pull/4": "--- a/retry.go\n+++ b/retry.go\n@@ -1 +1 @@\n",
+		"https://github.com/org4/repo4/pull/9": "--- a/export.go\n+++ b/export.go\n@@ -1 +1 @@\n",
 	} {
 		sum := sha1hex(u)
 		write(filepath.Join(".cache", "pr_diffs", sum+".json"), `{"diff":`+jsonQuote(diff)+`}`)
@@ -137,6 +159,29 @@ func buildLab(t *testing.T) (lab, repos string) {
 	gitc("remote", "add", "origin", origin)
 	gitc("fetch", "-q", "--depth", "1", "origin", "pull/1/head:refs/heads/pr-1")
 	initRepo(t, filepath.Join(repos, "org2", "repo2"), map[string]string{"x.rb": "x\n"}) // no remote → fetch fails
+	// org4: a clone whose origin carries refs/pull/9/head, so the first loadCorpus call
+	// pins it through the fetch path (no local ref beforehand).
+	origin4 := filepath.Join(t.TempDir(), "origin4")
+	initRepo(t, origin4, map[string]string{"export.go": "package main\n"})
+	if out, err := exec.Command("git", "-C", origin4, "rev-parse", "HEAD").Output(); err != nil {
+		t.Fatal(err)
+	} else if err := exec.Command("git", "-C", origin4, "update-ref", "refs/pull/9/head", strings.TrimSpace(string(out))).Run(); err != nil {
+		t.Fatal(err)
+	}
+	clone4 := filepath.Join(repos, "org4", "repo4")
+	if err := os.MkdirAll(clone4, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git4 := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = clone4
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	git4("init", "-q")
+	git4("remote", "add", "origin", origin4)
 	// repos/org3/repo3 deliberately missing → the URL for it is never pinned.
 	return lab, repos
 }
@@ -219,7 +264,9 @@ func TestClipAndHelpers(t *testing.T) {
 	if got := findingFileFromText("no path here at all"); got != "" {
 		t.Errorf("findingFileFromText no match = %q", got)
 	}
-	if claimKey("u", "t") == "" || claimKey("u", "t") != claimKey("u", "t") || claimKey("u", "t") == claimKey("u2", "t") {
+	first := claimKey("u", "t")
+	again := claimKey("u", "t")
+	if first == "" || first != again || first == claimKey("u2", "t") {
 		t.Error("claimKey must be deterministic and input-sensitive")
 	}
 	ev := evPaths(judge.RepoEvidence{Evidence: []claimcheck.Evidence{{Path: "test/a_test.rb"}, {Path: "spec/b_spec.rb"}}})
@@ -341,6 +388,15 @@ func TestCallJudgeVerdicts(t *testing.T) {
 	// connection refused
 	if _, err := callJudge(context.Background(), env{base: "http://127.0.0.1:1"}, "s", "u"); err == nil {
 		t.Error("unreachable endpoint must error")
+	}
+	// a body shorter than its declared Content-Length is a read error
+	trunc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		_, _ = io.WriteString(w, `{"choices":[`)
+	}))
+	defer trunc.Close()
+	if _, err := callJudge(context.Background(), env{base: trunc.URL}, "s", "u"); err == nil {
+		t.Error("truncated body must error")
 	}
 	// unparseable URL
 	if _, err := callJudge(context.Background(), env{base: "ht tp://bad"}, "s", "u"); err == nil {
@@ -527,6 +583,11 @@ func TestRealMainEndToEnd(t *testing.T) {
 	if code := realMain(); code != 0 {
 		t.Fatalf("realMain = %d, want 0", code)
 	}
+	setArgs(t, "claimcheck-ab", "-harnesseval", lab, "-repos", repos, "-out", out,
+		"-concurrency", "2", "-arms", "a,b")
+	if code := realMain(); code != 0 {
+		t.Fatalf("resume realMain = %d, want 0", code)
+	}
 	// arm A of the pre-seeded claim was skipped: only the remaining pairs called the judge
 	calls := strings.Count(strings.TrimSpace(got.data), "\n") + boolToInt(len(got.data) > 0)
 	if calls < 4 { // 5 claims × 2 arms − 1 skipped ≈ 9; loose floor guards fixture drift
@@ -542,6 +603,19 @@ func TestRealMainEndToEnd(t *testing.T) {
 	}
 	if after := judgeCalls(got); after != before {
 		t.Errorf("resume made %d new judge calls, want 0", after-before)
+	}
+	// a single-arm run still iterates both arms per claim; the filtered arm's continue
+	// must fire without judging anything new
+	if code := realMain(); code != 0 {
+		t.Fatalf("single-arm resume realMain = %d", code)
+	}
+	setArgs(t, "claimcheck-ab", "-harnesseval", lab, "-repos", repos, "-out", out,
+		"-concurrency", "2", "-arms", "a")
+	if code := realMain(); code != 0 {
+		t.Fatalf("single-arm realMain = %d", code)
+	}
+	if after := judgeCalls(got); after != before {
+		t.Errorf("single-arm resume made %d new judge calls, want 0", after-before)
 	}
 }
 
@@ -575,7 +649,7 @@ func TestRealMainFailurePaths(t *testing.T) {
 		}
 		t.Setenv("OPENAI_API_KEY", "k")
 		t.Setenv("OPENAI_BASE_URL", "http://127.0.0.1:1")
-		setArgs(t, "claimcheck-ab", "-harnesseval", lab, "-repos", repos, "-out", blocked)
+		setArgs(t, "claimcheck-ab", "-harnesseval", lab, "-repos", repos, "-out", blocked, "-limit", "1")
 		if code := realMain(); code != 1 {
 			t.Errorf("code = %d, want 1", code)
 		}

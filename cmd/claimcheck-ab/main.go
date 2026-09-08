@@ -188,7 +188,7 @@ func report(outDir string, stdout io.Writer) {
 		}
 		perArm[r.Arm] = append(perArm[r.Arm], row{arm: r.Arm, v2: r.V2Verdict, verdict: r.Verdict, err: r.Error, issue: r.IssueText})
 	}
-	fmt.Fprintln(stdout)
+	_, _ = fmt.Fprintln(stdout)
 	for _, arm := range []string{"a", "b"} {
 		rows := perArm[arm]
 		if len(rows) == 0 {
@@ -222,10 +222,10 @@ func report(outDir string, stdout io.Writer) {
 				trueErr++
 			}
 		}
-		fmt.Fprintf(stdout, "%s\n", title)
-		fmt.Fprintf(stdout, "  hallucinated gap-claims: confirmed (FALSE ACCEPTS)=%d rejected=%d errors=%d\n", halConf, halRej, halErr)
-		fmt.Fprintf(stdout, "  true gap findings:       confirmed=%d rejected (REGRESSIONS)=%d errors=%d\n", trueConf, trueRej, trueErr)
-		fmt.Fprintf(stdout, "  lab-unresolved claims:   %d (excluded from the matrix)\n", unresolved)
+		_, _ = fmt.Fprintf(stdout, "%s\n", title)
+		_, _ = fmt.Fprintf(stdout, "  hallucinated gap-claims: confirmed (FALSE ACCEPTS)=%d rejected=%d errors=%d\n", halConf, halRej, halErr)
+		_, _ = fmt.Fprintf(stdout, "  true gap findings:       confirmed=%d rejected (REGRESSIONS)=%d errors=%d\n", trueConf, trueRej, trueErr)
+		_, _ = fmt.Fprintf(stdout, "  lab-unresolved claims:   %d (excluded from the matrix)\n", unresolved)
 	}
 	// per-claim paired delta for the claims both arms judged
 	paired := map[string][2]string{}
@@ -245,7 +245,7 @@ func report(outDir string, stdout io.Writer) {
 			flips++
 		}
 	}
-	fmt.Fprintf(stdout, "\nclaims judged by both arms: %d; verdict flips between arms: %d\n", len(paired), flips)
+	_, _ = fmt.Fprintf(stdout, "\nclaims judged by both arms: %d; verdict flips between arms: %d\n", len(paired), flips)
 }
 
 func fatal(err error) int {

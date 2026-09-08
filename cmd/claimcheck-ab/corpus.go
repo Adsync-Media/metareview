@@ -114,19 +114,23 @@ func loadCorpus(dir, reposDir string) ([]record, map[string]string, *repoPass) {
 			continue
 		}
 		// Resolve (or create) a per-PR ref. refs/heads/pr-N persists across runs, so a
-		// previously fetched PR pins locally with no network round trip.
+		// previously fetched PR pins locally with no network round trip. Attempt 0 reads
+		// the local ref; attempt 1 fetches the PR head shallowly and re-reads it.
 		localRef := "refs/heads/pr-" + n
-		out, code, err := runGitRaw(context.Background(), rd, "rev-parse", "--verify", localRef+"^{commit}")
-		rev := strings.TrimSpace(string(out))
-		if err != nil || code != 0 || rev == "" {
-			if _, code, err := runGitRaw(context.Background(), rd, "fetch", "-q", "--depth", "1", "origin", "pull/"+n+"/head:"+localRef); err != nil || code != 0 {
-				continue
+		rev := ""
+		for attempt := 0; attempt < 2 && rev == ""; attempt++ {
+			if attempt == 1 {
+				if _, code, err := runGitRaw(context.Background(), rd, "fetch", "-q", "--depth", "1", "origin", "pull/"+n+"/head:"+localRef); err != nil || code != 0 {
+					break
+				}
 			}
-			out, code, err = runGitRaw(context.Background(), rd, "rev-parse", "--verify", localRef+"^{commit}")
-			if err != nil || code != 0 {
-				continue
+			out, code, err := runGitRaw(context.Background(), rd, "rev-parse", "--verify", localRef+"^{commit}")
+			if err == nil && code == 0 {
+				rev = strings.TrimSpace(string(out))
 			}
-			rev = strings.TrimSpace(string(out))
+		}
+		if rev == "" {
+			continue
 		}
 		rp.revs[u], rp.dirs[u] = rev, rd
 	}
