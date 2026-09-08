@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/dsifry/metareview/internal/contextpack"
+	"github.com/dsifry/metareview/internal/findings"
 	"github.com/dsifry/metareview/internal/lens"
 	"github.com/dsifry/metareview/internal/markdown"
 	"github.com/dsifry/metareview/internal/state"
@@ -81,7 +82,17 @@ func ensureFindingsIndex(root string) error {
 	if err := mkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return writeFile(path, []byte("# metareview Findings\n\nNo unresolved findings recorded yet.\n"), 0o644)
+	// The durable audit file has exactly two writers, with deliberately different contracts:
+	// findings.writeIndexAtomic is the only REPLACING writer of the index on the render and
+	// seed paths (unique temp, fsync, mode preservation; it creates when no index exists)
+	// — gate-run ROLLBACK restores prior file state through the generic file-snapshot
+	// machinery instead, which truncates in place; see the findings package's CHANGELOG
+	// scope note — and
+	// findings.WriteIndexSeed only ever CREATES (exclusive O_EXCL create-if-absent — never a
+	// replacement, so a racing render's freshly created index cannot be clobbered by the
+	// empty document). Do NOT route the seed through the replacer: that reopens the
+	// stat-then-seed TOCTOU the exclusive create exists to close.
+	return findings.WriteIndexSeed(path)
 }
 
 // rubricLinks maps a lens Slug to its dedicated rubric, for the lenses that have one. The rest

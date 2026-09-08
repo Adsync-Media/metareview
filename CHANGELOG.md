@@ -111,6 +111,50 @@
 
 ### Fixed
 
+- **A fresh git worktree can no longer clobber the committed `FINDINGS.md` (issue #151).** The
+  findings index is rendered from the per-worktree local ledger
+  (`.metareview/findings.jsonl`), so a gate run in a newly created worktree — whose ledger is
+  empty — rewrote the committed `docs/metareview/FINDINGS.md` to "No unresolved findings
+  recorded yet.", destroying the granted-override provenance and open blockers recorded by
+  other worktrees and sessions (observed twice on 2026-09-08; once swept into a PR and caught
+  only by CodeRabbit). The render now carries every committed blocker and override line whose
+  finding ID the local records do not contain, verbatim: a record the ledger knows (any
+  status) renders from the ledger and suppresses its committed line, so fresh local knowledge
+  always wins, and an empty ledger is NO information rather than "no findings" — the same
+  stance CoveredPaths takes for `none`-vs-absent. A committed index that exists but cannot be
+  read fails the render closed rather than overwriting it, and the replacement itself is
+  atomic: write-temp-then-rename (unique temp name, fsync before rename, the destination's
+  mode preserved, a write-protected index refused) instead of a truncating in-place write that
+  a crash mid-write would leave half-written. Carry-over is display-preserving only — it does
+  not feed the local ledger, cross-worktree enforcement (override list, blocking counts)
+  still reports local state, and carried lines have no retirement path once the originating
+  ledger is gone (clearing one means editing the committed file by hand). The renderer's
+  write path matches its promises: hand-maintained committed sections it does not emit (a
+  history note, a "Stale" partition) survive the rewrite instead of being deleted; every
+  emitted entry is one canonical physical line (free-text titles, override reasons, actors
+  and escalations are flattened, so an embedded newline can no longer split an entry whose
+  continuation would be lost on re-read); the committed index is read once per render (one
+  snapshot, one fail-closed policy, no mixed-snapshot race, CRLF normalized, a symlinked
+  index refused); and the durable audit file has exactly two writers with deliberately
+  different contracts — findings.writeIndexAtomic is the only replacing writer (the
+  render — it also creates when no index exists), and findings.WriteIndexSeed only ever
+  creates (exclusive create-if-absent, so a racing render's freshly created index cannot be
+  clobbered by the empty seed document; its error paths deliberately leave a partial seed
+  in place rather than remove a path a concurrent render may have renamed content into).
+  Concurrency + platform notes: concurrent renders are last-writer-wins for lines the
+  earlier writer rendered (local or committed-in-the-window) and self-heal at the next
+  render (the append-only records file is the source of truth — pinned by
+  TestConcurrentRenderLostUpdateSelfHeals); lines present in a reader's own committed
+  snapshot survive its rename via the carry-over, which is the issue-#151 guarantee; the
+  rename-atomicity guarantee is Unix rename(2) — Windows replaces via MoveFileEx without
+  a crash-atomicity promise.
+  Scope note: gate-run ROLLBACK restores prior file state through the generic
+  file-snapshot machinery (taskdone/prready/epicready/learning each carry a
+  restoreSnapshots copy), which still truncates in place — the two-writer contract above
+  covers the render and seed paths, not the rollback restorers; consolidating those onto
+  the atomic writer is follow-up work (the snapshot machinery is file-generic, so it is
+  not a one-line migration).
+
 - **PR-ready now selects findings for the target under review.** Findings linked to the current
   branch, live pull request, or a task review whose covered paths overlap the current diff retain
   their blocking effect. Unrelated historical blockers remain visible as repository-health

@@ -3,12 +3,14 @@ package findings
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/dsifry/metareview/internal/jsonl"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/dsifry/metareview/internal/jsonl"
+	"github.com/dsifry/metareview/internal/markdown"
 	"github.com/dsifry/metareview/internal/state"
 )
 
@@ -289,6 +291,50 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// emptyIndexBody is the shared "no unresolved findings" text; emptyIndexDocument is the
+// complete seed document. ONE literal, two users (the render default and the seed), so the
+// seed path and the render path cannot drift apart.
+const (
+	emptyIndexBody     = "No unresolved findings recorded yet."
+	emptyIndexDocument = "# metareview Findings\n\n" + emptyIndexBody + "\n"
+)
+
+// WriteIndexSeed creates the findings index IF IT DOES NOT EXIST, exclusively: O_EXCL,
+// never a replacement. The seed carries no information, so there is nothing to fsync-replace
+// — but the exclusive create is what closes the stat-then-seed TOCTOU (a racing render that
+// creates the index between the scaffold's Stat and its seed must not have its content
+// clobbered by an empty document: the issue-#151 destruction, reopened through the scaffold
+// path). EEXIST is success — someone else seeded it. The precise contract: the seed only
+// ever CREATES, never replaces; writeIndexAtomic creates-or-replaces (it creates the index
+// too when a render finds none — the seed is not the only creator, only the only
+// non-replacer). Note the seed's own mode is umask-subject (OpenFile applies it), where a
+// render-created index is deterministically 0644 — an accepted inconsistency between the
+// creating paths.
+func WriteIndexSeed(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil
+		}
+		return err
+	}
+	// On a mid-seed failure the partial file is deliberately LEFT in place: removing the
+	// final path from an error path could delete a concurrent render's atomic rename that
+	// landed in the window — reopening the issue-#151 destruction through a cross-writer
+	// error-path race — while a partial seed is re-readable content that never costs
+	// committed content (the seed only ever creates what did not exist) and that the next
+	// render replaces.
+	if err := seamWriteString(f, emptyIndexDocument); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := seamSync(f); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return seamClose(f)
+}
+
 func RenderIndex(root string) error {
 	records, err := readJSONL(findingsPath(root))
 	if err != nil {
@@ -297,28 +343,353 @@ func RenderIndex(root string) error {
 	return RenderIndexWithRecords(root, records)
 }
 
+// Note on the first-render file mode: a committed index that does not exist yet is created
+// at exactly 0644 (CreateTemp's 0600 raised by the explicit chmod, which no umask touches).
+// The pre-fix in-place write applied the process umask (0o644 & ~077 = 0600); the
+// deterministic 0644 matches what a git checkout gives the tracked file, which is the
+// honest mode for a committed, world-readable audit document.
+//
+// readCommittedIndex is the render's ONE read of the committed index, with the single
+// failure policy both parsers share: not-exist is "first render" (no bytes — nothing to
+// carry, nothing to preserve), a symlink is refused rather than followed (following one
+// would echo a planted target's mrvf-prefixed bullets into the committed index; the rename
+// that follows would replace the symlink itself, but the read happens first — the check is
+// check-then-act and therefore ADVISORY, like the write-protect check: a swap inside the
+// Lstat→ReadFile window is still followed, closing it atomically needs O_NOFOLLOW, and it
+// requires local write access to matter), any other
+// error fails the render closed — an unreadable committed index must never be overwritten
+// with a partial view — and CRLF is normalized once (a Windows autocrlf checkout must not
+// defeat the exact header match or drag \r into the canonical LF document).
+//
+// Size bound asymmetry, deliberate: findings.jsonl (machine-appended, unbounded growth)
+// is read through the line-capped jsonl.Scanner, while the committed index is read whole
+// with no cap — it is a human-reviewed git artifact whose growth is visible in review, and
+// a cap would fail the render closed on an audit trail that legitimately outgrew it,
+// trading a rare allocation for a durability break. If this ever matters, the bound should
+// come with a migration path for over-cap committed docs, not a hard refusal.
+func readCommittedIndex(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("committed findings index %s is a symlink — refusing to read it", path)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(strings.ReplaceAll(string(raw), "\r\n", "\n")), nil
+}
+
+// carryOverLine matches both shapes the index renders — unresolved-blocker bullets
+// ("- mrvf-… [high] Title (reviewer)") and Process Overrides entries ("- mrvf-… [granted] …") —
+// keyed by the leading finding ID, which is unique and stable across worktrees and sessions.
+var carryOverLine = regexp.MustCompile(`^- (mrvf-[A-Za-z0-9-]+) \[`)
+
+// carryOverLines returns the committed FINDINGS.md's blocker and override lines whose finding
+// IDs the rendering records do not know (issue #151).
+//
+// The local ledger (.metareview/findings.jsonl) is per-worktree transient state; the
+// committed docs/metareview/FINDINGS.md is the durable, shared audit trail. Rendering purely
+// from the local ledger let a fresh worktree — whose ledger is empty — rewrite the committed
+// file to "No unresolved findings recorded yet.", destroying the granted-override provenance
+// and open blockers recorded by other worktrees and sessions (observed twice on 2026-09-08;
+// once swept into a PR and caught only by CodeRabbit). The render now carries every committed
+// line whose finding ID the local records do not contain, verbatim: a record the ledger knows
+// (open, fixed, overridden — any status) renders from the ledger and suppresses its committed
+// line, so fresh local knowledge always wins — for a non-blocking status the record renders
+// as ABSENCE — and a record the ledger has never seen is preserved
+// rather than destroyed. An empty ledger is thereby NO INFORMATION, not "no findings" — the
+// same stance CoveredPaths takes for none-vs-absent.
+//
+// Scope boundary, stated so it is not read as more than it is: carry-over is
+// display-preserving ONLY. It does not feed carried records back into the local ledger, so
+// cross-worktree enforcement (override list, blocking counts) still reports local state, and
+// because finding IDs are run-scoped, the same underlying finding re-recorded in a second
+// worktree can render twice (its old committed line carried beside the new local one) — a
+// duplication that is strictly better than the destruction it replaced, and the price of
+// keying carry-over on the only stable identifier the lossy render carries. It also has no
+// retirement path: a carried line is suppressed only by a ledger that knows its finding ID,
+// and the ledger is transient, so after a clone or ledger cleanup a carried line renders
+// indefinitely — clearing it means editing the committed file by hand (or the durable
+// ledger reconcile #93-style work would give it).
+func carryOverLines(raw []byte, known map[string]bool) (blockers, overrides []string) {
+	// Carry-over is bounded to the two sections the renderer itself emits — the top
+	// unresolved-blockers section and Process Overrides. A bullet under ANY other section
+	// (a hand-maintained history, or the "Stale" partition the shelved #93 design adds) is
+	// left alone: verbatim preservation of a line is not preservation of its meaning, and
+	// promoting a stale section's entries to current blockers would resurrect dead findings.
+	const (
+		sectionTop = iota
+		sectionOverrides
+		sectionOther
+	)
+	// An entry is a matched bullet PLUS its continuation lines (the non-blank lines that
+	// directly follow it, before the next bullet, header or blank). The CURRENT renderer
+	// flattens free text to one physical line, but entries written by the OLD renderer can
+	// span lines — carrying only the first would silently drop the rest, so the whole block
+	// carries as one entry. A ledger-known bullet's continuations are skipped with it: the
+	// accumulator stays empty for a known ID, so nothing absorbs them. A blank line ends the
+	// entry; non-bullet prose no accumulator owns is not carried. Edge: a continuation line
+	// that itself matches the bullet pattern (legacy free text quoting a "- mrvf-… [" line)
+	// is treated as a new entry — the old renderer's format is ambiguous there, and
+	// splitting it is the documented behavior.
+	section := sectionTop
+	var entry []string
+	flush := func() {
+		if len(entry) == 0 {
+			return
+		}
+		switch section {
+		case sectionTop:
+			blockers = append(blockers, strings.Join(entry, "\n"))
+		case sectionOverrides:
+			overrides = append(overrides, strings.Join(entry, "\n"))
+		}
+		entry = nil
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, "## ") {
+			// EXACT match, not a prefix: a hand-maintained "## Process Overrides History"
+			// section must not have its prose deleted and its bullets promoted into the
+			// real Process Overrides section — the destroy-and-promote class this package
+			// exists to prevent. The renderer emits the header as exactly this string.
+			flush()
+			if line == "## Process Overrides" {
+				section = sectionOverrides
+			} else {
+				section = sectionOther
+			}
+			continue
+		}
+		if m := carryOverLine.FindStringSubmatch(line); m != nil {
+			flush()
+			if !known[m[1]] {
+				entry = []string{line}
+			}
+			continue
+		}
+		if line == "" {
+			flush()
+			continue
+		}
+		if len(entry) > 0 {
+			entry = append(entry, line)
+		}
+	}
+	flush()
+	return blockers, overrides
+}
+
 func RenderIndexWithRecords(root string, records []Record) error {
 	blockers := unresolvedBlockingFrom(records)
 	path := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	body := "No unresolved findings recorded yet."
-	if len(blockers) > 0 {
-		lines := make([]string, 0, len(blockers))
-		for _, finding := range blockers {
-			lines = append(lines, fmt.Sprintf("- %s [%s] %s (%s)", finding.ID, finding.Severity, finding.Title, finding.Reviewer))
+	known := make(map[string]bool, len(records))
+	for _, record := range records {
+		if record.ID != "" {
+			known[record.ID] = true
 		}
+	}
+	// ONE read of the committed index, one failure policy, handed to both parsers: reading
+	// it twice (carry-over, then preservation) could straddle a concurrent atomic rename and
+	// mix two snapshots, silently dropping every preserved section. Not-exist is "first
+	// render" — nothing to carry and nothing to preserve; any other read error fails the
+	// render closed rather than overwriting the durable audit trail with a partial view.
+	//
+	// KNOWN BOUNDARY: concurrent renders in one checkout are still last-writer-wins for
+	// LOCAL records — a render whose read predates another render's write re-emits its stale
+	// snapshot and drops the earlier writer's locally-rendered lines (committed lines
+	// survive: both writers carry them from their own reads). Closing that needs file
+	// locking or compare-and-swap; the unique-temp design made the temp collision impossible,
+	// not the read-modify-write against a stale base.
+	committed, err := readCommittedIndex(path)
+	if err != nil {
+		return err
+	}
+	coBlockers, coOverrides := carryOverLines(committed, known)
+	lines := make([]string, 0, len(blockers)+len(coBlockers))
+	for _, finding := range blockers {
+		// Emission is canonicalized to one physical line per entry: the committed index is
+		// re-read line-by-line by carryOverLines, so a free-text field carrying an embedded
+		// newline would make one entry span lines and only its first line carry back. Titles
+		// and reviewer names are flattened (whitespace runs to a single space, control
+		// characters dropped) so the writer and the reader agree on one form.
+		lines = append(lines, fmt.Sprintf("- %s [%s] %s (%s)", finding.ID, singleLine(finding.Severity),
+			singleLine(finding.Title), singleLine(finding.Reviewer)))
+	}
+	lines = append(lines, coBlockers...)
+	body := emptyIndexBody
+	if len(lines) > 0 {
 		body = strings.Join(lines, "\n")
 	}
 	document := "# metareview Findings\n\n" + body + "\n"
-	if overrides := overrideLines(records); len(overrides) > 0 {
+	overrides := append(overrideLines(records), coOverrides...)
+	if len(overrides) > 0 {
 		document += "\n## Process Overrides\n\n" +
 			"Deliberate exceptions to the review workflow. Pending entries still block CI.\n\n" +
 			strings.Join(overrides, "\n") + "\n"
 	}
-	return os.WriteFile(path, []byte(document), 0o644)
+	for _, section := range preservedSections(committed) {
+		document += "\n" + section + "\n"
+	}
+	return writeIndexAtomic(path, document)
 }
+
+// singleLine flattens a free-text field to the canonical single physical line every emitted
+// index entry uses (see the blocker-bullet comment).
+func singleLine(s string) string {
+	return markdown.PlainText(strings.Join(strings.Fields(s), " "))
+}
+
+// preservedSections extracts every committed ## section the renderer does not emit
+// (anything other than Process Overrides), verbatim, so hand-maintained content — a history
+// note, the shelved #93 "Stale" partition — survives the rewrite instead of being silently
+// deleted: the render regenerates only its own two sections and must not destroy the rest of
+// the committed file. Same trade-off as carried lines: a preserved section has no retirement
+// path, and removing one means editing the committed file by hand. Preserved sections are
+// re-emitted AFTER Process Overrides regardless of their committed position (content is
+// preserved, position is not). Note the boundary of the whole preservation contract: BULLETS
+// in the two owned sections carry, ## sections survive verbatim, but non-bullet PROSE inside
+// the owned sections (a hand-written paragraph in the top section or under Process
+// Overrides) is neither carried nor preserved — those two sections are generated, and their
+// prose does not survive a rewrite.
+func preservedSections(raw []byte) []string {
+	var out []string
+	var cur []string
+	flush := func() {
+		// EXACT match for the same reason as carryOverLines's section split (see there).
+		if len(cur) > 0 && cur[0] != "## Process Overrides" {
+			out = append(out, strings.TrimRight(strings.Join(cur, "\n"), "\n"))
+		}
+		cur = nil
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, "## ") {
+			flush()
+			cur = append(cur, line)
+			continue
+		}
+		if len(cur) > 0 {
+			cur = append(cur, line)
+		}
+	}
+	flush()
+	return out
+}
+
+// writeIndexAtomic replaces the committed index write-temp-then-rename, never a truncating
+// in-place write (note: rename replaces a SYMLINK at the target with a regular file, where the
+// old in-place write wrote through it): the committed index is the durable audit trail this package exists to
+// preserve, and os.WriteFile truncates before it writes — a crash or I/O failure mid-write
+// (disk full, process kill) would leave it truncated or half-written, the same data loss the
+// carry-over prevents on the read path. The rename replaces the file atomically; the temp
+// file sits beside it so the rename stays on one filesystem, and is removed on every path
+// that does not rename it.
+//
+// Platform scope: the replace-is-atomic guarantee is Unix rename(2). On Windows, Go's
+// os.Rename uses MoveFileEx with MOVEFILE_REPLACE_EXISTING — it replaces, but the
+// platform does not promise crash atomicity. The crash-atomicity contract holds on the
+// Unix runtimes this repo's gates run on; a Windows-specific replacement path is out of
+// scope (tracked with the other platform caveats, e.g. the sharing-violation note below).
+//
+// Concurrency contract (see the KNOWN BOUNDARY in RenderIndexWithRecords): concurrent
+// renders are last-writer-wins — the later rename can omit lines the earlier writer
+// rendered, whether local or committed-in-the-window (a line committed after this reader's
+// committed-index read is not carried and is dropped until healing). What the carry-over
+// DOES guarantee is the issue-#151 property: lines present in the reader's OWN committed
+// snapshot survive its rename, so an empty- or stale-records render never erases them.
+// This is deliberate: the rendered index is a DERIVED artifact, the
+// append-only .metareview/findings.jsonl is the source of truth, and every render
+// regenerates from the current records, so a lost update self-heals at the next render.
+// Serializing renders with a lock would close the window but adds a stale-lock failure
+// mode to a path that must fail safe; healing is the chosen trade-off (pinned by
+// TestConcurrentRenderLostUpdateSelfHeals).
+func writeIndexAtomic(path, document string) error {
+	// The destination's mode is preserved across replacement (rename does not carry it), and
+	// a write-PROTECTED index (owner-write bit clear — an operator's lock on the audit trail)
+	// is refused instead of being silently replaced by a fresh writable file. The check is
+	// the owner-write bit only: it catches the deliberate lock, not every EACCES the old
+	// in-place write could raise (a file another user owns and group/other cannot write still
+	// renames — rename needs directory permission, not file permission). It is also
+	// check-then-act and therefore ADVISORY: the mode is read before the write/sync/rename
+	// sequence, so a lock applied mid-render by another process can be overtaken by a writer
+	// already past the check — a real lock needs file-level enforcement this render does not
+	// attempt.
+	mode := os.FileMode(0o644)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
+		if mode&0o200 == 0 {
+			return fmt.Errorf("committed findings index %s is write-protected (mode %v) — refusing to replace it", path, mode)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	// A UNIQUE temp name, not path+".tmp": concurrent renders in one checkout (a gate run
+	// overlapping a Stop hook) share a fixed name, where one render's error cleanup can
+	// delete another's in-flight temp and turn its rename into a spurious failure. Unique
+	// names make the writers independent; the pattern is gitignored for the hard-crash
+	// window between write and rename.
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	// Seams over the fallible calls so their error branches — unreachable on a healthy
+	// filesystem in tests — stay covered by fault injection instead of being deleted for
+	// coverage (the repo's absPath precedent). Every failure path must remove the temp:
+	// a leftover would sit untracked in the committed docs/metareview tree until the next
+	// render, exactly the kind of file a careless `git add docs/metareview` sweeps in.
+	if err := seamWriteString(tmp, document); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return err
+	}
+	// Sync before rename: on delayed-allocation filesystems the rename can otherwise be
+	// journaled ahead of the data blocks, and a power loss leaves a zero-length index —
+	// which the next render would then read as nothing to carry.
+	if err := seamSync(tmp); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return err
+	}
+	if err := seamClose(tmp); err != nil {
+		// Best-effort remove: on Windows removing a file whose Close failed can hit a
+		// sharing violation and leave the temp behind — the gitignored pattern and the next
+		// render's unique names contain the residue.
+		_ = os.Remove(name)
+		return err
+	}
+	if err := seamChmod(name, mode); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	// Best-effort directory sync: the rename is durable only once the directory entry is.
+	// Failure is ignored deliberately — the rename already landed, and a dir-fsync error
+	// (unsupported on some platforms, e.g. Windows) must not fail a completed write.
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
+}
+
+var (
+	seamWriteString = func(f *os.File, s string) error { _, err := f.WriteString(s); return err }
+	seamSync        = func(f *os.File) error { return f.Sync() }
+	seamClose       = func(f *os.File) error { return f.Close() }
+	seamChmod       = func(name string, mode os.FileMode) error { return os.Chmod(name, mode) }
+)
 
 func UnresolvedBlocking(root string) ([]Record, error) {
 	records, err := readJSONL(findingsPath(root))

@@ -1,9 +1,13 @@
 package findings
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -654,6 +658,969 @@ func TestIsResolvedTerminalIsAnAllowlist(t *testing.T) {
 	for _, s := range no {
 		if IsResolvedTerminal(s) {
 			t.Errorf("IsResolvedTerminal(%q) = true; want false", s)
+		}
+	}
+}
+
+// The committed docs/metareview/FINDINGS.md is the durable, shared audit trail; the local
+// .metareview/findings.jsonl is per-worktree transient state. Before the carry-over fix
+// (issue #151), a gate run in a fresh worktree rendered the index purely from its empty
+// local ledger and rewrote the committed file to "No unresolved findings recorded yet.",
+// destroying granted-override provenance and open blockers recorded elsewhere. These tests
+// pin the three properties the fix exists for.
+func TestRenderPreservesCommittedLinesTheLedgerDoesNotKnow(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
+	committed := `# metareview Findings
+
+- mrvf-20260908-x-001 [high] No adjudicated lens review recorded (adversarial-review-reviewer)
+
+## Process Overrides
+
+Deliberate exceptions to the review workflow. Pending entries still block CI.
+
+- mrvf-20260903-y-001 [granted] Adversarial review was in-session-emulated — granted by agent-session-140 (shared-ledger residue cleanup per issue #138) at 2026-09-07T17:58:40Z: Historical advisory from a prior session's branch.
+`
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(committed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh worktree's ledger is EMPTY: the render must carry both committed lines
+	// forward verbatim, not collapse to the no-findings sentinel.
+	if err := RenderIndexWithRecords(root, nil); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := string(got)
+	if !strings.Contains(g, "- mrvf-20260908-x-001 [high] No adjudicated lens review recorded") {
+		t.Errorf("committed open blocker destroyed by an empty local ledger:\n%s", g)
+	}
+	if !strings.Contains(g, "- mrvf-20260903-y-001 [granted] Adversarial review was in-session-emulated") {
+		t.Errorf("committed override provenance destroyed by an empty local ledger:\n%s", g)
+	}
+
+	// Once the ledger KNOWS a finding (any status — here a fixed one), it renders from the
+	// ledger and suppresses the committed line: fresh local knowledge wins.
+	fixed := Record{ID: "mrvf-20260908-x-001", Status: "fixed", Severity: "high", Title: "No adjudicated lens review recorded", Reviewer: "adversarial-review-reviewer"}
+	if err := RenderIndexWithRecords(root, []Record{fixed}); err != nil {
+		t.Fatalf("render with known record: %v", err)
+	}
+	got, _ = os.ReadFile(path)
+	g = string(got)
+	if strings.Contains(g, "mrvf-20260908-x-001") {
+		t.Errorf("a finding the ledger knows must render from the ledger, not carry over:\n%s", g)
+	}
+	if !strings.Contains(g, "mrvf-20260903-y-001") {
+		t.Errorf("the override the ledger still does not know must survive:\n%s", g)
+	}
+}
+
+func TestRenderFreshRepositoryUnchanged(t *testing.T) {
+	root := t.TempDir()
+	// no committed index at all — the first render must behave exactly as before
+	if err := RenderIndexWithRecords(root, nil); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "docs", "metareview", "FINDINGS.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(got)) != "# metareview Findings\n\nNo unresolved findings recorded yet." {
+		t.Errorf("fresh render changed: %q", string(got))
+	}
+}
+
+func TestCarryOverLinesSplitsSectionsAndSkipsKnown(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
+	doc := `# metareview Findings
+
+- mrvf-a-001 [high] known blocker (reviewer)
+- mrvf-a-002 [high] unknown blocker (reviewer)
+
+## Process Overrides
+
+Deliberate exceptions to the review workflow. Pending entries still block CI.
+
+- mrvf-a-001 [granted] known override — granted by someone at some time: reason
+- mrvf-a-003 [pending] unknown override — requested by someone at some time: reason
+
+## Stale
+
+- mrvf-a-004 [low] bullet under a later section — must NOT be carried at all
+`
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockers, overrides := carryOverLines(raw, map[string]bool{"mrvf-a-001": true})
+	if len(blockers) != 1 || !strings.Contains(blockers[0], "mrvf-a-002") {
+		t.Errorf("blockers carry-over = %v, want only the unknown mrvf-a-002", blockers)
+	}
+	if len(overrides) != 1 || !strings.Contains(overrides[0], "mrvf-a-003") {
+		t.Errorf("overrides carry-over = %v, want only the unknown mrvf-a-003", overrides)
+	}
+	// a later ## section's bullets are NOT carried at all — verbatim preservation of a
+	// line is not preservation of its meaning (a Stale/history section must not be
+	// promoted to current blockers)
+	if len(blockers) != 1 || strings.Contains(strings.Join(blockers, "\n"), "mrvf-a-004") {
+		t.Errorf("blockers carry-over = %v, want only mrvf-a-002; post-section bullets must not carry", blockers)
+	}
+	// an ABSENT committed index is no information, not an error — the READ layer's job now;
+	// the parser just sees no bytes
+	b, o := carryOverLines(nil, nil)
+	if b != nil || o != nil {
+		t.Errorf("no committed bytes must carry nothing, got %v %v", b, o)
+	}
+}
+
+// The end-to-end regression for issue #151: Reconcile — the caller every gate actually
+// drives — run in a fresh worktree (empty local ledger) against a pre-seeded committed
+// FINDINGS.md must not destroy the committed provenance. Every other Reconcile test runs in
+// a bare TempDir with no committed index, so this is the only test that exercises the
+// caller-level path the clobber actually rode.
+func TestReconcileInFreshWorktreePreservesCommittedIndex(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
+	committed := "# metareview Findings\n\n" +
+		"- mrvf-20260908-060804291514000-task-done-kind-b7bb121c-001 [high] No adjudicated lens review recorded (adversarial-review-reviewer)\n\n" +
+		"## Process Overrides\n\n" +
+		"Deliberate exceptions to the review workflow. Pending entries still block CI.\n\n" +
+		"- mrvf-20260903-233630855862000-pr-ready-branch-10d735e5-001 [granted] Adversarial review was in-session-emulated — granted by agent-session-140 at 2026-09-07T17:58:40Z: Historical advisory from a prior session's branch.\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(committed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	run := Run{ID: "mrv-fresh", Scope: "pr-ready", Target: map[string]string{"type": "branch", "id": "feature-x"}, RepoRoot: root, GitHead: "fff"}
+	local := unsafeEval("eval introduced by this run.")
+	local.Fingerprint = "security:eval:lib/fresh.js"
+	if _, err := Reconcile(root, run, []Input{local}, Options{}); err != nil {
+		t.Fatalf("reconcile in fresh worktree: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := string(got)
+	if !strings.Contains(g, "mrvf-20260908-060804291514000-task-done-kind-b7bb121c-001") {
+		t.Errorf("committed open blocker destroyed by a fresh-worktree gate run:\n%s", g)
+	}
+	if !strings.Contains(g, "mrvf-20260903-233630855862000-pr-ready-branch-10d735e5-001 [granted]") {
+		t.Errorf("committed override provenance destroyed by a fresh-worktree gate run:\n%s", g)
+	}
+	if !strings.Contains(g, "mrvf-fresh") {
+		t.Errorf("the fresh run's own finding must also render:\n%s", g)
+	}
+}
+
+// Suppression must hold for the overridden status too, not just fixed: a record the ledger
+// holds as StatusOverridden renders its override line from the ledger, and the committed
+// line with the same ID must not ALSO carry — a failure here duplicates the Process
+// Overrides entry (caught in adversarial review of this fix).
+func TestRenderOverriddenLedgerRecordSuppressesItsCommittedOverrideLine(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
+	committed := "# metareview Findings\n\n" +
+		"## Process Overrides\n\n" +
+		"Deliberate exceptions to the review workflow. Pending entries still block CI.\n\n" +
+		"- mrvf-o-001 [granted] committed render of the override — granted by old-session at 2026-09-01: reason\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(committed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ledger := Record{ID: "mrvf-o-001", Status: StatusOverridden, Title: "ledger render of the override",
+		OverrideGrantedBy: "new-session", OverrideGrantedAt: "2026-09-08", OverrideGrantReason: "fresh local knowledge"}
+	if err := RenderIndexWithRecords(root, []Record{ledger}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(path)
+	g := string(got)
+	if strings.Contains(g, "committed render of the override") {
+		t.Errorf("a ledger-known overridden record must suppress its committed line:\n%s", g)
+	}
+	if !strings.Contains(g, "ledger render of the override") || !strings.Contains(g, "new-session") {
+		t.Errorf("the ledger's own override line must render:\n%s", g)
+	}
+}
+
+// The atomic-replace error paths: the render must fail (and clean up its temp file) when
+// the temp write or the rename cannot complete, never leave a half-written committed index.
+func TestWriteIndexAtomicFailsClosedAndCleansUp(t *testing.T) {
+	// rename failure, portable: the target is a directory, so the temp write succeeds and
+	// the rename onto it cannot.
+	root := t.TempDir()
+	path := filepath.Join(root, "FINDINGS.md")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeIndexAtomic(path, "# index"); err == nil {
+		t.Fatal("a rename that cannot complete must fail the write")
+	}
+	leftovers, err := filepath.Glob(filepath.Join(root, ".FINDINGS.md.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Errorf("the temp file must be cleaned up after a failed rename, got %v", leftovers)
+	}
+
+	// temp-write failure: the containing directory is read-only, so creating the temp file
+	// fails (permission-based, unprivileged POSIX only).
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("permission-based unreadability does not apply on windows or as root")
+	}
+	root2 := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root2, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(root2, "sub"), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeIndexAtomic(filepath.Join(root2, "sub", "FINDINGS.md"), "# index"); err == nil {
+		t.Fatal("a temp write that cannot complete must fail the write")
+	}
+	leftovers, err = filepath.Glob(filepath.Join(root2, "sub", ".FINDINGS.md.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Errorf("no temp file may survive a failed write, got %v", leftovers)
+	}
+}
+
+// The replacement preserves the committed index's mode (rename does not carry it), and a
+// write-PROTECTED index — an operator's lock on the audit trail — fails closed instead of
+// being silently replaced by a fresh writable file (the old in-place write failed EACCES).
+func TestWriteIndexAtomicPreservesModeAndRespectsWriteProtection(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits")
+	}
+	root := t.TempDir()
+	path := filepath.Join(root, "FINDINGS.md")
+	// 0o664, not 0o600: os.CreateTemp already creates the temp at 0600, so seeding 0600
+	// passes even with the mode-preservation chmod deleted — the assertion must see a mode
+	// the temp file never has on its own.
+	if err := os.WriteFile(path, []byte("# old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// chmod after creation: WriteFile's perm is masked by the process umask (0664 & ~022 =
+	// 0644), which would quietly turn this back into a mode CreateTemp also produces.
+	if err := os.Chmod(path, 0o664); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeIndexAtomic(path, "# new"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o664 {
+		t.Errorf("replacement mode = %v, want the destination's 0664 preserved", info.Mode().Perm())
+	}
+
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores write-protection bits")
+	}
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeIndexAtomic(path, "# clobber"); err == nil {
+		t.Fatal("a write-protected committed index must fail the render, not be replaced")
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != "# new" {
+		t.Errorf("write-protected index must be untouched, got %q", string(got))
+	}
+}
+
+// Unique temp names make concurrent renders independent: two renders racing in one checkout
+// (a gate run overlapping a Stop hook) must both succeed, and no fixed-name temp exists for
+// one render's cleanup to delete the other's.
+func TestWriteIndexAtomicConcurrentRendersAreIndependent(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "FINDINGS.md")
+	if err := os.WriteFile(path, []byte("# seed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// DISTINCT payloads per writer: with identical documents, a fixed shared-temp
+	// implementation (the exact race this test exists to exclude) can still pass — every
+	// interleaving of equal writes over one name is benign. Distinct payloads make the
+	// interleavings observable.
+	const n = 8
+	docs := make([]string, n)
+	for i := range docs {
+		docs[i] = "# metareview Findings\n\nwriter " + strconv.Itoa(i) + "\n"
+	}
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func(doc string) { errs <- writeIndexAtomic(path, doc) }(docs[i])
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent render failed: %v", err)
+		}
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := string(got)
+	// every writer succeeded, so the file must be exactly one writer's document —
+	// whole and uncorrupted, never a splice of two
+	whole := false
+	for i := range docs {
+		if final == docs[i] {
+			whole = true
+			break
+		}
+	}
+	if !whole {
+		t.Errorf("final index is not any single writer's document (spliced?): %q", final)
+	}
+	leftovers, err := filepath.Glob(filepath.Join(root, ".FINDINGS.md.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Errorf("temp files survived concurrent renders: %v", leftovers)
+	}
+}
+
+// The injected-fault half of writeIndexAtomic's error surface: every seam failure must
+// fail the write closed AND remove the temp file — a leftover would sit untracked in the
+// committed docs/metareview tree until the next render, exactly the kind of file a careless
+// `git add docs/metareview` sweeps into a commit.
+func TestWriteIndexAtomicFaultInjectionCleansUp(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		inject func()
+	}{
+		{"write", func() { seamWriteString = func(*os.File, string) error { return fmt.Errorf("disk full") } }},
+		{"sync", func() { seamSync = func(*os.File) error { return fmt.Errorf("sync failed") } }},
+		{"chmod", func() { seamChmod = func(string, os.FileMode) error { return fmt.Errorf("chmod failed") } }},
+		{"close", func() { seamClose = func(*os.File) error { return fmt.Errorf("close failed") } }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			savedWrite, savedSync, savedChmod, savedClose := seamWriteString, seamSync, seamChmod, seamClose
+			defer func() {
+				seamWriteString, seamSync, seamChmod, seamClose = savedWrite, savedSync, savedChmod, savedClose
+			}()
+			tc.inject()
+			root := t.TempDir()
+			path := filepath.Join(root, "FINDINGS.md")
+			if err := os.WriteFile(path, []byte("# seed"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeIndexAtomic(path, "# new"); err == nil {
+				t.Fatalf("%s fault must fail the write", tc.name)
+			}
+			leftovers, err := filepath.Glob(filepath.Join(root, ".FINDINGS.md.tmp-*"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(leftovers) != 0 {
+				t.Errorf("%s fault left temp files behind: %v", tc.name, leftovers)
+			}
+			got, _ := os.ReadFile(path)
+			if string(got) != "# seed" {
+				t.Errorf("%s fault must leave the committed index untouched, got %q", tc.name, string(got))
+			}
+		})
+	}
+}
+
+// A Stat failure that is NOT not-exist (here: ENOTDIR — the index's parent is a file) is an
+// error, not "no committed index yet".
+func TestWriteIndexAtomicFailsOnStrangeStatError(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "docs")
+	if err := os.WriteFile(parent, []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeIndexAtomic(filepath.Join(parent, "metareview", "FINDINGS.md"), "# x"); err == nil {
+		t.Fatal("a non-notexist Stat error must fail the write")
+	}
+}
+
+// fsync-before-rename is the durability guarantee the atomic replacement claims; only its
+// failure branch is fault-injected, so deleting the sync call would leave the suite green.
+// A spy around the real seamSync pins that a happy-path render actually syncs.
+func TestWriteIndexAtomicSyncsBeforeRename(t *testing.T) {
+	saved := seamSync
+	defer func() { seamSync = saved }()
+	synced := 0
+	seamSync = func(f *os.File) error { synced++; return saved(f) }
+	root := t.TempDir()
+	path := filepath.Join(root, "FINDINGS.md")
+	if err := os.WriteFile(path, []byte("# old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeIndexAtomic(path, "# new"); err != nil {
+		t.Fatal(err)
+	}
+	if synced != 1 {
+		t.Errorf("happy-path render synced %d times, want exactly 1", synced)
+	}
+}
+
+// The carry-over parser and the render's own emitters are two hand-maintained descriptions
+// of one committed-index format; if they drift apart (severity rendering, ID format, the
+// "- ID [" prefix, the single-line canonical form), every carried line silently stops
+// matching and the next render drops it — the issue-#151 destruction reopened on a
+// format-drift path. This round-trip pins their agreement the way reviewlog's schema does:
+// one owner, one round-trip test.
+func TestCarryOverMatchesWhatTheRenderEmits(t *testing.T) {
+	root := t.TempDir()
+	records := []Record{
+		// Severity stays canonical: a non-canonical severity would not classify as blocking
+		// and never emit, so the newline-flattening of severity is defense-in-depth — the
+		// REVIEWER carries the observable multi-line case here.
+		{ID: "mrvf-rt-001", Status: "open", Severity: "high", Classification: "blocking",
+			Title: "an open blocker", Reviewer: "security-\nreviewer"},
+		// every free-text field below carries an embedded newline: the emitter must flatten
+		// ALL of them (title, actors, reasons, escalation), or the entry spans physical
+		// lines and carry-over re-reads only its first
+		{ID: "mrvf-rt-002", Status: StatusOverridden, Title: "an overridden\nfinding",
+			OverrideGrantedBy: "a human\nwith a newline", OverrideGrantedAt: "2026-09-08T00:00:00Z\n",
+			OverrideGrantReason: "accepted\nrisk"},
+		{ID: "mrvf-rt-003", Status: StatusOverridePending, Title: "a pending\noverride",
+			OverrideRequestedBy: "an\nagent", OverrideRequestedAt: "2026-09-08T00:00:00Z\n",
+			OverrideRequestReason: "needs\na human",
+			OverrideEscalation:    "an escalation that spans\ntwo physical lines"},
+		// a free-text field with an embedded newline: the emitter must flatten it to one
+		// physical line, or carry-over re-reads only the first line of a two-line entry
+		{ID: "mrvf-rt-004", Status: "open", Severity: "critical", Classification: "blocking",
+			Title: "a title that spans\ntwo physical lines", Reviewer: "reviewer"},
+	}
+	if err := RenderIndexWithRecords(root, records); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
+
+	// fresh worktree: nothing known — EVERY emitted line must carry back through the parser
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockers, overrides := carryOverLines(raw, map[string]bool{})
+	if len(blockers) != 2 {
+		t.Errorf("emitted blockers did not carry back: %v", blockers)
+	}
+	for _, id := range []string{"mrvf-rt-001", "mrvf-rt-004"} {
+		if !strings.Contains(strings.Join(blockers, "\n"), id) {
+			t.Errorf("blocker %s missing from carry-back: %v", id, blockers)
+		}
+	}
+	if !strings.Contains(strings.Join(blockers, "\n"), "a title that spans two physical lines") {
+		t.Errorf("the multi-line title was not flattened to the canonical single line: %v", blockers)
+	}
+	if !strings.Contains(strings.Join(blockers, "\n"), "(security- reviewer)") {
+		t.Errorf("the multi-line reviewer was not flattened to the canonical single line: %v", blockers)
+	}
+	for _, flat := range []string{
+		"an overridden finding", "a pending override", "a human with a newline", "accepted risk",
+		"an agent", "needs a human",
+		"an escalation that spans two physical lines",
+	} {
+		if !strings.Contains(strings.Join(overrides, "\n"), flat) {
+			t.Errorf("a multi-line free-text field was not flattened (%q): %v", flat, overrides)
+		}
+	}
+	// every emitted line must be exactly one physical line
+	for _, l := range append(append([]string{}, blockers...), overrides...) {
+		if strings.ContainsAny(l, "\n\r") {
+			t.Errorf("emitted entry spans physical lines: %q", l)
+		}
+	}
+	if len(overrides) != 2 {
+		t.Errorf("emitted overrides did not carry back: %v", overrides)
+	}
+	for _, id := range []string{"mrvf-rt-002", "mrvf-rt-003"} {
+		if !strings.Contains(strings.Join(overrides, "\n"), id) {
+			t.Errorf("override %s missing from carry-back: %v", id, overrides)
+		}
+	}
+}
+
+// Hand-maintained committed sections the renderer does not emit (a history note, the
+// shelved #93 "Stale" partition) must survive the rewrite — the render regenerates its own
+// two sections and must not delete the rest of the committed file.
+func TestRenderPreservesSectionsItDoesNotEmit(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
+	committed := "# metareview Findings\n\n" +
+		"- mrvf-a-001 [high] an open blocker (reviewer)\n\n" +
+		"## Process Overrides\n\n" +
+		"Deliberate exceptions to the review workflow. Pending entries still block CI.\n\n" +
+		"- mrvf-a-002 [granted] an override — granted by someone at some time: reason\n\n" +
+		"## Stale\n\n" +
+		"Findings from old heads, kept for the audit trail.\n\n" +
+		"- mrvf-a-003 [medium] a stale-head finding (reviewer)\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(committed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := RenderIndexWithRecords(root, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(path)
+	g := string(got)
+	if !strings.Contains(g, "## Stale") || !strings.Contains(g, "mrvf-a-003") {
+		t.Errorf("a committed section the renderer does not emit was deleted:\n%s", g)
+	}
+	if !strings.Contains(g, "mrvf-a-001") || !strings.Contains(g, "mrvf-a-002") {
+		t.Errorf("carried lines lost:\n%s", g)
+	}
+	// and the stale bullet is NOT promoted: it stays inside its own section, not the top
+	topEnd := strings.Index(g, "## Process Overrides")
+	if topEnd < 0 {
+		t.Fatalf("the overrides header vanished from the render:\n%s", g)
+	}
+	if strings.Contains(g[:topEnd], "mrvf-a-003") {
+		t.Errorf("stale-section bullet promoted to a current blocker:\n%s", g)
+	}
+}
+
+func TestWriteIndexSeedContent(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteIndexSeed(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != emptyIndexDocument {
+		t.Errorf("seed content = %q", string(got))
+	}
+}
+
+// Rewrite stability (the property issue #151 is about): rendering twice over the file the
+// first render wrote — carried lines, preserved sections and local records re-read from the
+// new layout — must not duplicate a carried line or a preserved section.
+func TestRenderIsIdempotentOverItsOwnOutput(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
+	committed := "# metareview Findings\n\n" +
+		"- mrvf-idem-001 [high] an open blocker (reviewer)\n\n" +
+		"## Process Overrides\n\n" +
+		"Deliberate exceptions to the review workflow. Pending entries still block CI.\n\n" +
+		"- mrvf-idem-002 [granted] an override — granted by someone at some time: reason\n\n" +
+		"## Stale\n\n" +
+		"- mrvf-idem-003 [medium] a stale-head finding (reviewer)\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(committed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := RenderIndexWithRecords(root, nil); err != nil {
+			t.Fatalf("render %d: %v", i, err)
+		}
+	}
+	got, _ := os.ReadFile(path)
+	g := string(got)
+	for _, id := range []string{"mrvf-idem-001", "mrvf-idem-002", "mrvf-idem-003"} {
+		if n := strings.Count(g, id); n != 1 {
+			t.Errorf("%s appears %d times after two renders:\n%s", id, n, g)
+		}
+	}
+	if n := strings.Count(g, "## Stale"); n != 1 {
+		t.Errorf("the Stale section appears %d times after two renders:\n%s", n, g)
+	}
+}
+
+// A hand-maintained section whose header merely STARTS with the overrides header must not
+// be mistaken for it: its prose survives, its bullets are not promoted into the real
+// Process Overrides section (the exact-header-match regression pin).
+func TestNearMissOverrideHeaderIsItsOwnSection(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
+	committed := "# metareview Findings\n\n" +
+		"- mrvf-nm-001 [high] an open blocker (reviewer)\n\n" +
+		"## Process Overrides\n\n" +
+		"Deliberate exceptions to the review workflow. Pending entries still block CI.\n\n" +
+		"- mrvf-nm-002 [granted] a real override — granted by someone at some time: reason\n\n" +
+		"## Process Overrides History\n\n" +
+		"Hand-maintained history of overrides past.\n\n" +
+		"- mrvf-nm-003 [granted] a historical override — granted by someone at some time: reason\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(committed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := RenderIndexWithRecords(root, nil); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	g := string(raw)
+	if !strings.Contains(g, "## Process Overrides History") || !strings.Contains(g, "Hand-maintained history") {
+		t.Errorf("the near-miss header section was deleted:\n%s", g)
+	}
+	// the history bullet must survive INSIDE its own section, not be promoted toward the
+	// real overrides section
+	histAt := strings.Index(g, "## Process Overrides History")
+	realAt := strings.Index(g, "## Process Overrides\n")
+	if realAt < 0 || histAt < 0 || histAt < realAt {
+		t.Fatalf("section order unexpected:\n%s", g)
+	}
+	if strings.Contains(g[:histAt], "mrvf-nm-003") {
+		t.Errorf("the history bullet was promoted toward the real overrides section:\n%s", g)
+	}
+	if !strings.Contains(g, "mrvf-nm-003") {
+		t.Errorf("the history bullet must survive:\n%s", g)
+	}
+}
+
+// The seed is create-if-absent, exclusively: a racing writer that creates the index between
+// the scaffold's Stat and its seed must not have its content clobbered by the empty
+// document (the stat-then-seed TOCTOU the eighth review round caught).
+func TestWriteIndexSeedNeverClobbersExistingContent(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "FINDINGS.md")
+	if err := os.WriteFile(path, []byte("# metareview Findings\n\n- mrvf-t-001 [high] precious committed content (r)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteIndexSeed(path); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(path)
+	if strings.Contains(string(got), "No unresolved findings recorded yet") {
+		t.Errorf("the seed replaced existing content:\n%s", string(got))
+	}
+	if !strings.Contains(string(got), "precious committed content") {
+		t.Errorf("existing content lost:\n%s", string(got))
+	}
+}
+
+// The seed's fault-injection half: every seam failure fails the seed, and a
+// non-EEXIST open failure (a read-only directory) fails it too — an empty seed must never
+// be mistaken for a successful render's absence of findings.
+func TestWriteIndexSeedFaultInjection(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		inject func()
+	}{
+		{"write", func() { seamWriteString = func(*os.File, string) error { return fmt.Errorf("disk full") } }},
+		{"sync", func() { seamSync = func(*os.File) error { return fmt.Errorf("sync failed") } }},
+		{"close", func() { seamClose = func(*os.File) error { return fmt.Errorf("close failed") } }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			savedWrite, savedSync, savedClose := seamWriteString, seamSync, seamClose
+			defer func() { seamWriteString, seamSync, seamClose = savedWrite, savedSync, savedClose }()
+			tc.inject()
+			root := t.TempDir()
+			path := filepath.Join(root, "FINDINGS.md")
+			if err := WriteIndexSeed(path); err == nil {
+				t.Fatalf("%s fault must fail the seed", tc.name)
+			}
+			// LEAVE-IN-PLACE contract: the error path must NOT remove the final path — a
+			// remove there could delete a concurrent render's atomic rename that landed in
+			// the window, and a partial seed is re-readable content the next render replaces.
+			if _, err := os.Stat(path); err != nil {
+				t.Fatalf("%s fault removed the partial seed (the error path must leave it): %v", tc.name, err)
+			}
+		})
+	}
+
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("permission-based unreadability does not apply on windows or as root")
+	}
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteIndexSeed(filepath.Join(root, "FINDINGS.md")); err == nil {
+		t.Fatal("an uncreatable seed path must fail, not report success")
+	}
+}
+
+// A CRLF working tree (git autocrlf on Windows) must not defeat the exact header match or
+// drag \r into the canonical LF document: the single read normalizes.
+func TestRenderNormalizesCRLFCommittedIndex(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
+	committed := "# metareview Findings\r\n\r\n" +
+		"- mrvf-crlf-001 [high] an open blocker (reviewer)\r\n\r\n" +
+		"## Process Overrides\r\n\r\n" +
+		"Deliberate exceptions to the review workflow. Pending entries still block CI.\r\n\r\n" +
+		"- mrvf-crlf-002 [granted] an override — granted by someone at some time: reason\r\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(committed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := RenderIndexWithRecords(root, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(path)
+	g := string(got)
+	if strings.Contains(g, "\r") {
+		t.Errorf("CRLF leaked into the canonical LF document:\n%q", g)
+	}
+	if !strings.Contains(g, "mrvf-crlf-002 [granted]") {
+		t.Errorf("the CRLF overrides section was not recognized (exact header match defeated):\n%s", g)
+	}
+	if strings.Count(g, "## Process Overrides") != 1 {
+		t.Errorf("the overrides section was duplicated instead of carried:\n%s", g)
+	}
+}
+
+// A symlinked committed index is refused, not followed.
+func TestRenderRefusesSymlinkedCommittedIndex(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "planted.md")
+	if err := os.WriteFile(target, []byte("# metareview Findings\n\n- mrvf-sym-001 [high] planted bullet (r)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "docs", "metareview")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "FINDINGS.md")
+	if err := os.Symlink(target, path); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := RenderIndexWithRecords(root, nil); err == nil {
+		t.Fatal("a symlinked committed index must be refused, not followed")
+	}
+	// the symlink itself must be untouched: the render failed before any write, so the
+	// path still IS a symlink pointing at the planted target (not a regular file, and the
+	// planted content has not been echoed anywhere)
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("the failed render replaced the symlink with a regular file")
+	}
+}
+
+// readCommittedIndex's contract, each branch: not-exist is no-bytes (first render), a
+// symlink is refused, an ENOTDIR Lstat (the index's parent is a file) is an error, and CRLF
+// is normalized.
+func TestReadCommittedIndexContract(t *testing.T) {
+	root := t.TempDir()
+	absent := filepath.Join(root, "absent.md")
+	if b, err := readCommittedIndex(absent); err != nil || b != nil {
+		t.Errorf("absent index must be no-bytes without error, got %v %v", b, err)
+	}
+
+	parent := filepath.Join(root, "docs")
+	if err := os.WriteFile(parent, []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readCommittedIndex(filepath.Join(parent, "metareview", "FINDINGS.md")); err == nil {
+		t.Fatal("a non-notexist Lstat error must fail the read")
+	}
+
+	target := filepath.Join(root, "planted.md")
+	if err := os.WriteFile(target, []byte("- mrvf-s [high] planted (r)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "linked.md")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := readCommittedIndex(link); err == nil {
+		t.Fatal("a symlinked index must be refused, not followed")
+	}
+
+	crlf := filepath.Join(root, "crlf.md")
+	if err := os.WriteFile(crlf, []byte("a\r\nb\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := readCommittedIndex(crlf); err != nil || string(b) != "a\nb\n" {
+		t.Errorf("CRLF not normalized: %q %v", string(b), err)
+	}
+}
+
+// The read layer's fail-closed path at the render level: a committed index that exists,
+// is stat-able, but cannot be read must fail the render — never overwrite what it could
+// not read (the end-to-end statement of the unreadable-index rule).
+func TestRenderFailsClosedOnUnreadableCommittedIndex(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("permission-based unreadability does not apply on windows or as root")
+	}
+	root := t.TempDir()
+	path := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("# metareview Findings\n\n- mrvf-x-001 [high] a committed blocker (r)\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	if err := RenderIndexWithRecords(root, nil); err == nil {
+		t.Fatal("an unreadable committed index must fail the render")
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != "# metareview Findings\n\n- mrvf-x-001 [high] a committed blocker (r)\n" {
+		t.Errorf("the unreadable committed index must be left untouched, got %q", string(got))
+	}
+}
+
+// Legacy multi-line entries — written by the OLD renderer, whose free-text fields could
+// span physical lines — must carry WHOLE (bullet plus continuations), and a ledger-known
+// bullet's continuations must be skipped with it.
+func TestCarryOverCarriesLegacyMultiLineEntriesWhole(t *testing.T) {
+	raw := []byte("# metareview Findings\n\n" +
+		"- mrvf-leg-001 [high] a legacy entry whose title spans\n  two physical lines (reviewer)\n" +
+		"- mrvf-leg-002 [high] a known entry whose continuation\n  must be skipped with it (reviewer)\n\n" +
+		"## Process Overrides\n\n" +
+		"Deliberate exceptions to the review workflow. Pending entries still block CI.\n\n" +
+		"- mrvf-leg-003 [granted] a legacy override — granted by someone\n  at some time: reason\n")
+	blockers, overrides := carryOverLines(raw, map[string]bool{"mrvf-leg-002": true})
+	if len(blockers) != 1 || !strings.Contains(blockers[0], "a legacy entry whose title spans\n  two physical lines") {
+		t.Errorf("legacy multi-line entry not carried whole: %q", blockers)
+	}
+	if len(overrides) != 1 || !strings.Contains(overrides[0], "granted by someone\n  at some time") {
+		t.Errorf("legacy multi-line override not carried whole: %q", overrides)
+	}
+	if strings.Contains(strings.Join(blockers, "\n")+strings.Join(overrides, "\n"), "mrvf-leg-002") {
+		t.Errorf("a known bullet's continuations must be skipped with it: %v %v", blockers, overrides)
+	}
+}
+
+// The preserved-section position contract: preserved sections re-emit AFTER Process
+// Overrides regardless of their committed position (content is preserved, position is not).
+func TestPreservedSectionsEmitAfterOverrides(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
+	committed := "# metareview Findings\n\n" +
+		"## Stale\n\n" +
+		"- mrvf-pos-001 [low] a stale finding that lived ABOVE the overrides (r)\n\n" +
+		"## Process Overrides\n\n" +
+		"Deliberate exceptions to the review workflow. Pending entries still block CI.\n\n" +
+		"- mrvf-pos-002 [granted] an override — granted by someone at some time: reason\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(committed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := RenderIndexWithRecords(root, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(path)
+	g := string(got)
+	staleAt := strings.Index(g, "## Stale")
+	overridesAt := strings.Index(g, "## Process Overrides\n")
+	if staleAt < 0 || overridesAt < 0 {
+		t.Fatalf("both sections must survive:\n%s", g)
+	}
+	if staleAt < overridesAt {
+		t.Errorf("preserved section must re-emit AFTER Process Overrides regardless of committed position:\n%s", g)
+	}
+}
+
+// The concurrency contract (writeIndexAtomic's doc + the KNOWN BOUNDARY in
+// RenderIndexWithRecords): concurrent renders are last-writer-wins — a render whose
+// committed-index read predates another render's rename re-emits its stale snapshot and
+// drops the earlier writer's lines (here B's locally-rendered line; a line committed in
+// another reader's read-to-rename window fares the same) — and a lost update SELF-HEALS
+// at the next render, because the rendered index is derived from the append-only records
+// file. What the carry-over guarantees, and what issue #151 was about, is that lines
+// present in a reader's OWN committed snapshot survive its rename; this test pins the
+// dropped-line half plus the healing.
+func TestConcurrentRenderLostUpdateSelfHeals(t *testing.T) {
+	root := t.TempDir()
+	findingsDir := filepath.Join(root, ".metareview")
+	if err := os.MkdirAll(findingsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mkRecord := func(id, title string) Record {
+		return Record{
+			SchemaVersion:  1,
+			ID:             id,
+			RunID:          "mrv-heal-run",
+			Reviewer:       "heal-test",
+			Severity:       "high",
+			Classification: "blocking",
+			Status:         "open",
+			Target:         map[string]any{"type": "pr", "id": "1"},
+			Title:          title,
+			Finding:        title,
+			Expected:       "expected",
+			Found:          "found",
+			Recommendation: "recommendation",
+			Fingerprint:    "fp:" + id,
+		}
+	}
+	recordsA := []Record{mkRecord("mrvf-heal-001", "from render A")}
+	recordsB := []Record{mkRecord("mrvf-heal-002", "from render B")}
+	union := append(append([]Record{}, recordsA...), recordsB...)
+	// The append-only source of truth ends up holding BOTH record sets (in the real flow
+	// each render appends to this file before rendering; the race only affects the derived
+	// document's construction from a stale snapshot).
+	var buf bytes.Buffer
+	for _, r := range union {
+		if err := json.NewEncoder(&buf).Encode(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(findingsDir, "findings.jsonl"), buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The race, serialized: both renders read a committed index that does not exist yet, so
+	// neither carries the other's lines. B renders and renames first...
+	if err := RenderIndexWithRecords(root, recordsB); err != nil {
+		t.Fatal(err)
+	}
+	// ...then A's stale pre-built document renames over it (what A would have written from
+	// its own snapshot): the derived document now omits B's line — the documented lost
+	// update for LOCAL records.
+	docA := "# metareview Findings\n\n- mrvf-heal-001 [high] from render A (heal-test)\n"
+	path := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
+	if err := writeIndexAtomic(path, docA); err != nil {
+		t.Fatal(err)
+	}
+	doc, _ := os.ReadFile(path)
+	if strings.Contains(string(doc), "mrvf-heal-002") {
+		t.Fatalf("precondition: the stale overwrite should omit B's line:\n%s", doc)
+	}
+	if !strings.Contains(string(doc), "mrvf-heal-001") {
+		t.Fatalf("precondition: A's own line must be present:\n%s", doc)
+	}
+	// The next render regenerates from the CURRENT records (the union) and heals.
+	if err := RenderIndex(root); err != nil {
+		t.Fatal(err)
+	}
+	doc, _ = os.ReadFile(path)
+	for _, id := range []string{"mrvf-heal-001", "mrvf-heal-002"} {
+		if !strings.Contains(string(doc), id) {
+			t.Errorf("post-heal document must carry %s (self-healing contract):\n%s", id, doc)
 		}
 	}
 }

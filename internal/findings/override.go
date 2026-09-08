@@ -190,16 +190,23 @@ func mutateFinding(root, findingID string, apply func(*Record) error) error {
 func overrideLines(records []Record) []string {
 	var lines []string
 	for _, record := range records {
+		// Free-text fields are flattened to the canonical single physical line every emitted
+		// index entry uses: the committed index is re-read line-by-line by carryOverLines, so
+		// an embedded newline in a title or reason would make one entry span lines and only
+		// its first line carry back (see the findings.go blocker-bullet comment).
+		title, reqReason := singleLine(record.Title), singleLine(record.OverrideRequestReason)
+		reqBy, grantedBy := singleLine(record.OverrideRequestedBy), singleLine(record.OverrideGrantedBy)
+		reqAt, grantedAt := singleLine(record.OverrideRequestedAt), singleLine(record.OverrideGrantedAt)
 		switch record.Status {
 		case StatusOverridePending:
 			lines = append(lines, withEscalation(fmt.Sprintf("- %s [pending] %s — requested by %s at %s: %s",
-				record.ID, record.Title, record.OverrideRequestedBy, record.OverrideRequestedAt, record.OverrideRequestReason), record))
+				record.ID, title, reqBy, reqAt, reqReason), record))
 		case StatusOverridden:
 			detail := fmt.Sprintf("- %s [granted] %s — granted by %s at %s: %s",
-				record.ID, record.Title, record.OverrideGrantedBy, record.OverrideGrantedAt, record.OverrideGrantReason)
+				record.ID, title, grantedBy, grantedAt, singleLine(record.OverrideGrantReason))
 			if record.OverrideRequestedBy != "" {
 				detail += fmt.Sprintf(" (requested by %s at %s: %s)",
-					record.OverrideRequestedBy, record.OverrideRequestedAt, record.OverrideRequestReason)
+					reqBy, reqAt, reqReason)
 			}
 			lines = append(lines, withEscalation(detail, record))
 		}
@@ -208,10 +215,12 @@ func overrideLines(records []Record) []string {
 }
 
 // withEscalation appends the escalation context when the record carries one, so
-// the index shows why the workflow was stepped outside of and not just that it was.
+// the index shows why the workflow was stepped outside of and not just that it was. The
+// escalation is free text (a CLI --escalation value) and is flattened to the canonical
+// single physical line every emitted entry uses — see the findings.go blocker-bullet comment.
 func withEscalation(detail string, record Record) string {
 	if record.OverrideEscalation == "" {
 		return detail
 	}
-	return detail + fmt.Sprintf(" [escalation: %s]", record.OverrideEscalation)
+	return detail + fmt.Sprintf(" [escalation: %s]", singleLine(record.OverrideEscalation))
 }
