@@ -4,13 +4,6 @@ node_modules/
 *.log
 .DS_Store
 
-# metareview: keep ephemeral review state local while syncing durable learning state
-.metareview/*
-!.metareview/knowledge/
-.metareview/knowledge/*
-!.metareview/knowledge/metareview.jsonl
-!.metareview/calibration.jsonl
-!.metareview/learning-runs.jsonl
 /covergate
 
 # Local, uncommitted session handoff prompts (see .handoffs/README not tracked)
@@ -25,3 +18,11 @@ docs/metareview/.FINDINGS.md.tmp-*
 
 # stray root build output (bin/metareview is the real target)
 /metareview
+
+# metareview: keep ephemeral review state local while syncing durable learning state
+.metareview/*
+!.metareview/knowledge/
+.metareview/knowledge/*
+!.metareview/knowledge/metareview.jsonl
+!.metareview/calibration.jsonl
+!.metareview/learning-runs.jsonl
