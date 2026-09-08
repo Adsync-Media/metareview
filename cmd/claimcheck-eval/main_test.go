@@ -2,13 +2,18 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/dsifry/metareview/internal/fsm/run"
 )
 
 // The fixture is a miniature harnesseval: one run whose PR diff carries a covering spec
@@ -466,5 +471,522 @@ func TestVerboseLimitCountsPrintedDetailsOnly(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "evidence: spec/models/widget_spec.rb") {
 		t.Errorf("a skipped uncached claim consumed the limit; the measurable claim's detail is missing:\n%s", buf.String())
+	}
+}
+
+// ---- issue #146: the repo-side structural pass over the corpus ----
+
+// gitFixture builds a corpus clone whose refs/pull/N/head carries the given files, the
+// shape the operator's -repos directory provides (one clone per PR repo; the pass pins
+// each PR's head rev by fetching its pull ref).
+func gitFixture(t *testing.T, reposDir string, files map[string]string) (cloneDir, rev string) {
+	t.Helper()
+	origin := t.TempDir()
+	gitRun := func(dir string, args ...string) string {
+		out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	for p, body := range files {
+		full := filepath.Join(origin, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitRun(origin, "init", "-q")
+	// hermetic identity: the repo's test helpers never depend on the operator's global
+	// git config, and neither does this fixture
+	gitRun(origin, "config", "user.email", "fixture@example.invalid")
+	gitRun(origin, "config", "user.name", "fixture")
+	gitRun(origin, "add", "-A")
+	gitRun(origin, "commit", "-q", "-m", "spec")
+	gitRun(origin, "update-ref", "refs/pull/7/head", "HEAD")
+	rev = gitRun(origin, "rev-parse", "refs/pull/7/head")
+	cloneDir = filepath.Join(reposDir, "org", "repo")
+	if out, err := exec.Command("git", "clone", "-q", origin, cloneDir).CombinedOutput(); err != nil {
+		t.Fatalf("clone: %v\n%s", err, out)
+	}
+	return cloneDir, rev
+}
+
+func TestRepoPassResolvesAndSearchesThePinnedHead(t *testing.T) {
+	reposDir := t.TempDir()
+	gitFixture(t, reposDir, map[string]string{
+		"spec/models/widget_spec.rb": "let!(:widget) { Fabricate(:widget) }\nexpect(widget.shine).to eq(true)\n",
+	})
+	pass, missing := resolveRepos(options{repos: reposDir}, []record{
+		{URL: "https://github.com/org/repo/pull/7"},
+	}, realGit, realGitRaw)
+	if missing != nil {
+		t.Fatalf("missing = %v; want none", missing)
+	}
+	if pass.rev("https://github.com/org/repo/pull/7") == "" {
+		t.Fatal("the PR head rev was not pinned")
+	}
+	ev, err := pass.search("https://github.com/org/repo/pull/7", run.Finding{
+		File: "app/models/widget.rb", IssueText: "the widget polish path has no test asserting the shine"})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if !ev.Ran || len(ev.Evidence) != 1 || ev.Evidence[0].Path != "spec/models/widget_spec.rb" {
+		t.Fatalf("evidence = %+v ran=%v; want the covering spec", ev.Evidence, ev.Ran)
+	}
+	// A URL with no clone and an unparseable URL are disclosed, not fatal.
+	_, missing = resolveRepos(options{repos: reposDir}, []record{
+		{URL: "https://github.com/org/absent/pull/1"},
+		{URL: "not-a-pr-url"},
+	}, realGit, realGitRaw)
+	if missing == nil || !strings.Contains(missing.Error(), "org/absent#1") || !strings.Contains(missing.Error(), "not-a-pr-url") {
+		t.Errorf("missing = %v; want both disclosed", missing)
+	}
+}
+
+// With -repos the matrix gains the combined rows. The fixture must truly produce each
+// classification (the row labels are printed unconditionally, so asserting the label
+// alone is vacuous) — this parses the matrix cells and asserts the hallucination column.
+func TestReportReposPassRows(t *testing.T) {
+	reposDir := t.TempDir()
+	gitFixture(t, reposDir, map[string]string{
+		// claim 1's covering spec is in the diff AND at head → "both"
+		"spec/models/widget_spec.rb": "let!(:widget) { Fabricate(:widget) }\nexpect(widget.shine).to be_present\n",
+		// claim 2's covering spec exists ONLY at head → "repo-only"
+		"spec/models/helper_spec.rb": "describe 'the helper module' do\n  it 'asserts something' do\n  end\nend\n",
+	})
+	records := []record{
+		{URL: "https://github.com/org/repo/pull/7", IssueText: "the widget polish path has no test asserting the shine", NewVerdict: "hallucination", SourceLens: "lens-a"},
+		{URL: "https://github.com/org/repo/pull/7", IssueText: "zero tests exist for the helper module", NewVerdict: "hallucination", SourceLens: "lens-a"},
+		// subject only in the DIFF's spec hunks, absent from the head tree → "diff-only"
+		{URL: "https://github.com/org/repo/pull/7", IssueText: "the polish and shimmer behavior is untested", NewVerdict: "hallucination", SourceLens: "lens-b"},
+		// subject no source carries → "no-evidence"
+		{URL: "https://github.com/org/repo/pull/7", IssueText: "the frobnicate quux behavior is untested", NewVerdict: "hallucination", SourceLens: "lens-b"},
+	}
+	// the diff carries the widget spec hunks (widget+shine) and a polish spec the head
+	// tree does not have; the head tree carries no polish/shimmer content
+	diff := "diff --git a/app/models/widget.rb b/app/models/widget.rb\n--- a/app/models/widget.rb\n+++ b/app/models/widget.rb\n@@ -3,2 +3,4 @@\n" +
+		"+  def polish(g)\n+    g.try(:shimmer)\n" +
+		"diff --git a/spec/models/widget_spec.rb b/spec/models/widget_spec.rb\n--- a/spec/models/widget_spec.rb\n+++ b/spec/models/widget_spec.rb\n@@ -5,2 +5,4 @@\n" +
+		"+    let!(:widget) { Fabricate(:widget) }\n+    expect(widget.shine).to be_present\n" +
+		"diff --git a/spec/models/polish_spec.rb b/spec/models/polish_spec.rb\n--- /dev/null\n+++ b/spec/models/polish_spec.rb\n@@ -0,0 +1,2 @@\n" +
+		"+  it 'has shimmer' do\n+    expect(widget.polish).to be_present\n"
+	var buf bytes.Buffer
+	if err := report(&buf, records, map[string]string{"https://github.com/org/repo/pull/7": diff},
+		options{repos: reposDir, dir: "testdata/mini", framework: "test-fw"}); err != nil {
+		t.Fatal(err)
+	}
+	got := matrixCells(buf.String(), []string{"both", "diff-only", "repo-only", "no-evidence"})
+	want := map[string]int{"both": 1, "diff-only": 1, "repo-only": 1, "no-evidence": 1}
+	for _, row := range []string{"both", "diff-only", "repo-only", "no-evidence"} {
+		if got[row] != want[row] {
+			t.Errorf("matrix row %q hallucination cell = %d, want %d\n%s", row, got[row], want[row], buf.String())
+		}
+	}
+}
+
+// matrixCells parses the report's matrix rows into the hallucination column's count.
+func matrixCells(out string, rows []string) map[string]int {
+	cells := map[string]int{}
+	for _, line := range strings.Split(out, "\n") {
+		for _, row := range rows {
+			if !strings.HasPrefix(line, row) || strings.Contains(line, "evidence\\v2") {
+				continue
+			}
+			fields := strings.Fields(strings.TrimPrefix(line, row))
+			if len(fields) >= 3 { // bug, important_non_bug, hallucination, unresolved
+				if n, err := strconv.Atoi(fields[2]); err == nil {
+					cells[row] = n
+				}
+			}
+		}
+	}
+	return cells
+}
+
+// A claim whose PR has no clone is disclosed and measured on the diff dimension alone;
+// the repo dimension must not silently shrink the matrix.
+func TestReportReposPassDisclosesMissingClones(t *testing.T) {
+	reposDir := t.TempDir()
+	gitFixture(t, reposDir, map[string]string{
+		"spec/models/widget_spec.rb": "let!(:widget) { Fabricate(:widget) }\nexpect(widget.shine).to eq(true)\n",
+	})
+	records := []record{
+		{URL: "https://github.com/org/repo/pull/7", IssueText: "the widget polish path has no test asserting the shine", NewVerdict: "hallucination", SourceLens: "lens-a"},
+		{URL: "https://github.com/org/absent/pull/1", IssueText: "zero tests exist for the helper module", NewVerdict: "hallucination", SourceLens: "lens-a"},
+	}
+	diff := "diff --git a/spec/models/widget_spec.rb b/spec/models/widget_spec.rb\n--- a/spec/models/widget_spec.rb\n+++ b/spec/models/widget_spec.rb\n@@ -5,2 +5,4 @@\n" +
+		"+    expect(widget.shine).to eq(true)\n"
+	var buf bytes.Buffer
+	if err := report(&buf, records, map[string]string{
+		"https://github.com/org/repo/pull/7": diff, "https://github.com/org/absent/pull/1": diff,
+	}, options{repos: reposDir, dir: "testdata/mini", framework: "test-fw"}); err != nil {
+		t.Fatal(err)
+	}
+	if out := buf.String(); !strings.Contains(out, "without a repo clone") {
+		t.Errorf("missing clones must be disclosed:\n%s", out)
+	}
+	// the no-clone claim lands in its own row, not folded into no-evidence
+	if got := matrixCells(buf.String(), []string{"no-clone"}); got["no-clone"] != 1 {
+		t.Errorf("the uncloned claim must land in the no-clone row:\n%s", buf.String())
+	}
+}
+
+// realGit surfaces git's exit code as code (not error) and a failed process start as
+// error with code -1.
+func TestRealGitSurfacesExitCodesAndStartFailures(t *testing.T) {
+	origin := t.TempDir()
+	if out, err := exec.Command("git", "-C", origin, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+	s, code, err := realGit(context.Background(), origin, "rev-parse", "--is-inside-work-tree")
+	if err != nil || code != 0 || s != "true" {
+		t.Fatalf("realGit = %q, %d, %v", s, code, err)
+	}
+	if _, code, err := realGit(context.Background(), origin, "rev-parse", "NOPE"); err != nil || code == 0 {
+		t.Fatalf("a git failure must travel as code: %d, %v", code, err)
+	}
+	if _, code, err := realGit(context.Background(), filepath.Join(origin, "missing"), "status"); err == nil || code != -1 {
+		t.Fatalf("a start failure must be an error: %d, %v", code, err)
+	}
+}
+
+// The resolve step's failure modes are each disclosed: a fetch that fails and a
+// rev-parse that fails on an existing clone.
+func TestRepoPassFetchAndRevFailuresAreDisclosed(t *testing.T) {
+	reposDir := t.TempDir()
+	cloneDir := filepath.Join(reposDir, "org", "repo")
+	if err := os.MkdirAll(cloneDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	records := []record{{URL: "https://github.com/org/repo/pull/7"}}
+	fakeRaw := func(ctx context.Context, dir string, args ...string) ([]byte, int, error) {
+		return []byte("abc"), 0, nil
+	}
+	fake := func(ctx context.Context, dir string, args ...string) (string, int, error) {
+		if args[0] == "fetch" {
+			return "", 128, nil
+		}
+		return "", 0, nil
+	}
+	if _, missing := resolveRepos(options{repos: reposDir}, records, fake, fakeRaw); missing == nil || !strings.Contains(missing.Error(), "fetch failed") {
+		t.Errorf("missing = %v; want the fetch failure disclosed", missing)
+	}
+	fake = func(ctx context.Context, dir string, args ...string) (string, int, error) {
+		if args[0] == "rev-parse" {
+			return "", 0, nil // rev-parse succeeded but printed nothing
+		}
+		return "abc", 0, nil
+	}
+	if _, missing := resolveRepos(options{repos: reposDir}, records, fake, fakeRaw); missing == nil || !strings.Contains(missing.Error(), "rev-parse failed") {
+		t.Errorf("missing = %v; want the rev-parse failure disclosed", missing)
+	}
+}
+
+// A URL the pass never resolved yields a non-ran search, not an error.
+func TestRepoPassSearchWithoutRev(t *testing.T) {
+	p := &repoPass{revs: map[string]string{}, dirs: map[string]string{}}
+	ev, err := p.search("https://github.com/org/repo/pull/1", run.Finding{IssueText: "no tests"})
+	if err != nil || ev.Ran {
+		t.Errorf("search = %+v, %v; want non-ran, nil", ev, err)
+	}
+}
+
+// The git seams keep absence and failure distinct, and surface failures.
+func TestRepoPassSeamErrors(t *testing.T) {
+	p := &repoPass{runGit: func(ctx context.Context, dir string, args ...string) (string, int, error) {
+		return "", 0, context.Canceled
+	}, runRaw: func(ctx context.Context, dir string, args ...string) ([]byte, int, error) {
+		return nil, 0, context.Canceled
+	}}
+	if _, err := p.grepHead(context.Background(), "d", "rev")("pat"); err == nil {
+		t.Error("a grep transport error must surface")
+	}
+	if _, _, err := p.showHead(context.Background(), "d", "rev")("p"); err == nil {
+		t.Error("an ls-tree transport error must surface")
+	}
+	// grep is read raw and NUL-separated (-z): a path with spaces survives, and the rev:
+	// prefix is stripped per NUL entry
+	p.runRaw = func(ctx context.Context, dir string, args ...string) ([]byte, int, error) {
+		return []byte("\x00rev:spec with space.rb\x00"), 0, nil
+	}
+	if paths, err := p.grepHead(context.Background(), "d", "rev")("pat"); err != nil || len(paths) != 1 || paths[0] != "spec with space.rb" {
+		t.Errorf("NUL-separated grep output = %v, %v", paths, err)
+	}
+	p.runRaw = func(ctx context.Context, dir string, args ...string) ([]byte, int, error) {
+		return nil, 128, nil
+	}
+	if _, err := p.grepHead(context.Background(), "d", "rev")("pat"); err == nil {
+		t.Error("a grep failure exit must surface")
+	}
+	calls := 0
+	p.runRaw = func(ctx context.Context, dir string, args ...string) ([]byte, int, error) {
+		calls++
+		if args[0] == "ls-tree" {
+			return nil, 128, nil
+		}
+		return []byte(revZ), 0, nil
+	}
+	if _, _, err := p.showHead(context.Background(), "d", "rev")("p"); err == nil {
+		t.Error("an ls-tree failure exit must surface")
+	}
+	p.runRaw = func(ctx context.Context, dir string, args ...string) ([]byte, int, error) {
+		calls++
+		if args[0] == "cat-file" {
+			return nil, 1, nil
+		}
+		return []byte(revZ), 0, nil // ls-tree lists the path; cat-file then fails
+	}
+	if _, _, err := p.showHead(context.Background(), "d", "rev")("p"); err == nil {
+		t.Error("a cat-file failure exit must surface")
+	}
+	p.runRaw = func(ctx context.Context, dir string, args ...string) ([]byte, int, error) {
+		if args[0] == "cat-file" {
+			return nil, 0, context.Canceled
+		}
+		return []byte(revZ), 0, nil
+	}
+	if _, _, err := p.showHead(context.Background(), "d", "rev")("p"); err == nil {
+		t.Error("a cat-file transport error must surface")
+	}
+	// absence: ls-tree lists nothing (the shared seam reads ls-tree via the raw runner)
+	p.runRaw = func(ctx context.Context, dir string, args ...string) ([]byte, int, error) {
+		return nil, 0, nil
+	}
+	if body, ok, err := p.showHead(context.Background(), "d", "rev")("p"); err != nil || ok || body != nil {
+		t.Errorf("absent path = %v, %v, %v; want nil, false, nil", body, ok, err)
+	}
+}
+
+const revZ = "rev\x00path\x00"
+
+// A per-claim search error during the report is counted and disclosed, never fatal —
+// the claim stays measured on the diff dimension (driven through report's git seam).
+func TestReportReposPassSearchErrorsAreCounted(t *testing.T) {
+	reposDir := t.TempDir()
+	gitFixture(t, reposDir, map[string]string{
+		"spec/models/widget_spec.rb": "let!(:widget) { Fabricate(:widget) }\nexpect(widget.shine).to eq(true)\n",
+	})
+	records := []record{
+		{URL: "https://github.com/org/repo/pull/7", IssueText: "the widget polish path has no test asserting the shine", NewVerdict: "hallucination", SourceLens: "lens-a"},
+	}
+	diff := "diff --git a/app/models/widget.rb b/app/models/widget.rb\n--- a/app/models/widget.rb\n+++ b/app/models/widget.rb\n@@ -3,2 +3,4 @@\n" +
+		"+  def polish(g)\n+    g.try(:shine)\n"
+	prev := reportGitRaw
+	reportGitRaw = func(ctx context.Context, dir string, args ...string) ([]byte, int, error) {
+		if args[0] == "grep" {
+			return nil, 128, nil
+		}
+		return prev(ctx, dir, args...)
+	}
+	defer func() { reportGitRaw = prev }()
+	var buf bytes.Buffer
+	if err := report(&buf, records, map[string]string{"https://github.com/org/repo/pull/7": diff},
+		options{repos: reposDir, dir: "testdata/mini", framework: "test-fw"}); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "repo search errors: 1") {
+		t.Errorf("search errors must be counted and disclosed:\n%s", out)
+	}
+	// the errored claim classifies as "repo-error" (its own row), NOT diff-only — parse
+	// the cells rather than a substring of the unconditionally-printed row labels
+	if got := matrixCells(out, []string{"repo-error"}); got["repo-error"] != 1 {
+		t.Errorf("the errored claim must land in the repo-error row:\n%s", out)
+	}
+}
+
+// A record URL whose org/repo are not plain path components is refused: the -repos pass
+// joins them into filesystem paths, and ".." (or anything shell-adjacent) must never
+// reach dirExists.
+func TestRepoPassRejectsUnsafeURLComponents(t *testing.T) {
+	reposDir := t.TempDir()
+	misleading := filepath.Join(reposDir, "..", "escape")
+	if err := os.MkdirAll(misleading, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pass, missing := resolveRepos(options{repos: reposDir}, []record{
+		{URL: "https://github.com/../escape/pull/7"},
+	}, realGit, realGitRaw)
+	if pass.rev("https://github.com/../escape/pull/7") != "" {
+		t.Error("a traversal URL must not resolve to a rev")
+	}
+	if missing == nil {
+		t.Error("the traversal URL must be disclosed as missing, not silently used")
+	}
+}
+
+// Blob reads must be byte-exact: a spec whose content has leading/trailing whitespace or
+// interior blank lines must reach the search untouched (realGit's trim would shift lines).
+func TestRepoPassShowHeadIsByteExact(t *testing.T) {
+	reposDir := t.TempDir()
+	gitFixture(t, reposDir, map[string]string{
+		"spec/models/widget_spec.rb": "\n\nlet!(:widget) { Fabricate(:widget) }\n\nexpect(widget.shine).to eq(true)\n\n",
+	})
+	pass, missing := resolveRepos(options{repos: reposDir}, []record{
+		{URL: "https://github.com/org/repo/pull/7"},
+	}, realGit, realGitRaw)
+	if missing != nil {
+		t.Fatalf("missing = %v", missing)
+	}
+	ev, err := pass.search("https://github.com/org/repo/pull/7", run.Finding{
+		File: "app/models/widget.rb", IssueText: "the widget polish path has no test asserting the shine"})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	body := ev.Content["spec/models/widget_spec.rb"]
+	if !strings.HasPrefix(body, "\n\nlet!(:widget)") {
+		t.Errorf("blob content was trimmed — line numbers shift: %q", body)
+	}
+}
+
+// Claims whose PR has no clone and claims whose search errored get their OWN matrix rows,
+// so the repo dimension's gaps are explicit instead of folded into diff-only/no-evidence.
+func TestReportReposPassSeparateGapRows(t *testing.T) {
+	reposDir := t.TempDir()
+	gitFixture(t, reposDir, map[string]string{
+		"spec/models/widget_spec.rb": "let!(:widget) { Fabricate(:widget) }\nexpect(widget.shine).to eq(true)\n",
+	})
+	records := []record{
+		{URL: "https://github.com/org/repo/pull/7", IssueText: "the widget polish path has no test asserting the shine", NewVerdict: "hallucination", SourceLens: "lens-a"},
+		{URL: "https://github.com/org/absent/pull/1", IssueText: "zero tests exist for the helper module", NewVerdict: "hallucination", SourceLens: "lens-a"},
+	}
+	diff := "diff --git a/spec/models/widget_spec.rb b/spec/models/widget_spec.rb\n--- a/spec/models/widget_spec.rb\n+++ b/spec/models/widget_spec.rb\n@@ -5,2 +5,4 @@\n" +
+		"+    expect(widget.shine).to eq(true)\n"
+	prev := reportGitRaw
+	reportGitRaw = func(ctx context.Context, dir string, args ...string) ([]byte, int, error) {
+		if args[0] == "grep" {
+			return nil, 128, nil
+		}
+		return prev(ctx, dir, args...)
+	}
+	defer func() { reportGitRaw = prev }()
+	var buf bytes.Buffer
+	if err := report(&buf, records, map[string]string{
+		"https://github.com/org/repo/pull/7": diff, "https://github.com/org/absent/pull/1": diff,
+	}, options{repos: reposDir, dir: "testdata/mini", framework: "test-fw"}); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	got := matrixCells(out, []string{"no-clone", "repo-error"})
+	if got["no-clone"] != 1 || got["repo-error"] != 1 {
+		t.Errorf("the gap rows must carry their claims:\n%s", out)
+	}
+}
+
+// The traversal guard is character-level: separators, leading dots, and empty components
+// are refused; plain names pass.
+func TestSafeComponent(t *testing.T) {
+	yes := []string{"grafana", "my-repo", "repo.name", "repo_name", "R2"}
+	no := []string{"", ".", "..", "../x", "a/b", "-lead", ".hidden", "a b", "a\tb"}
+	for _, s := range yes {
+		if !safeComponent(s) {
+			t.Errorf("safeComponent(%q) = false; want true", s)
+		}
+	}
+	for _, s := range no {
+		if safeComponent(s) {
+			t.Errorf("safeComponent(%q) = true; want false", s)
+		}
+	}
+}
+
+// showHead keeps absence and failure distinct at the raw seam too.
+func TestRepoPassShowHeadTransportError(t *testing.T) {
+	okGit := func(ctx context.Context, dir string, args ...string) (string, int, error) {
+		return "p\x00", 0, nil
+	}
+	p := &repoPass{runGit: okGit, runRaw: func(ctx context.Context, dir string, args ...string) ([]byte, int, error) {
+		return nil, 0, context.Canceled
+	}}
+	if _, _, err := p.showHead(context.Background(), "d", "rev")("p"); err == nil {
+		t.Error("a cat-file transport error must surface")
+	}
+	p.runRaw = func(ctx context.Context, dir string, args ...string) ([]byte, int, error) {
+		return nil, 128, nil
+	}
+	if _, _, err := p.showHead(context.Background(), "d", "rev")("p"); err == nil {
+		t.Error("a cat-file failure exit must surface")
+	}
+	// absence: ls-tree lists nothing (the shared seam reads ls-tree raw)
+	p.runRaw = func(ctx context.Context, dir string, args ...string) ([]byte, int, error) {
+		return nil, 0, nil
+	}
+	p.runGit = func(ctx context.Context, dir string, args ...string) (string, int, error) {
+		return "", 0, nil
+	}
+	if body, ok, err := p.showHead(context.Background(), "d", "rev")("p"); err != nil || ok || body != nil {
+		t.Errorf("absent path = %v, %v, %v; want nil, false, nil", body, ok, err)
+	}
+}
+
+// The hallucination rollup counts claims the repo dimension MEASURED: no-clone and
+// repo-error rows are infrastructure gaps, not "without covering evidence" — folding
+// them in overstates the search's recall against hallucinations.
+func TestReportReposPassRollupExcludesInfraRows(t *testing.T) {
+	reposDir := t.TempDir()
+	gitFixture(t, reposDir, map[string]string{
+		"spec/models/widget_spec.rb": "let!(:widget) { Fabricate(:widget) }\nexpect(widget.shine).to eq(true)\n",
+	})
+	records := []record{
+		{URL: "https://github.com/org/repo/pull/7", IssueText: "the widget polish path has no test asserting the shine", NewVerdict: "hallucination", SourceLens: "lens-a"},
+		{URL: "https://github.com/org/absent/pull/1", IssueText: "zero tests exist for the helper module", NewVerdict: "hallucination", SourceLens: "lens-a"},
+	}
+	diff := "diff --git a/spec/models/widget_spec.rb b/spec/models/widget_spec.rb\n--- a/spec/models/widget_spec.rb\n+++ b/spec/models/widget_spec.rb\n@@ -5,2 +5,4 @@\n" +
+		"+    expect(widget.shine).to eq(true)\n"
+	var buf bytes.Buffer
+	if err := report(&buf, records, map[string]string{
+		"https://github.com/org/repo/pull/7": diff, "https://github.com/org/absent/pull/1": diff,
+	}, options{repos: reposDir, dir: "testdata/mini", framework: "test-fw"}); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	// one hallucinated claim with evidence (both), one unmeasured on the repo dimension
+	if !strings.Contains(out, "hallucinated gap-claims with covering evidence (measured rows only): 1/1") {
+		t.Errorf("the rollup must exclude no-clone and repo-error rows:\n%s", out)
+	}
+}
+
+// The operator-facing flat clone layout (<repos>/org-repo) resolves when the nested form
+// is absent — a documented contract, so a regression to it must fail a test.
+func TestRepoPassResolvesFlatLayout(t *testing.T) {
+	reposDir := t.TempDir()
+	origin := t.TempDir()
+	gitRun := func(dir string, args ...string) string {
+		out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	spec := "spec/models/widget_spec.rb"
+	if err := os.MkdirAll(filepath.Join(origin, "spec/models"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(origin, spec), []byte("let!(:widget) { Fabricate(:widget) }\nexpect(widget.shine).to eq(true)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(origin, "init", "-q")
+	gitRun(origin, "config", "user.email", "fixture@example.invalid")
+	gitRun(origin, "config", "user.name", "fixture")
+	gitRun(origin, "add", "-A")
+	gitRun(origin, "commit", "-q", "-m", "spec")
+	gitRun(origin, "update-ref", "refs/pull/7/head", "HEAD")
+	cloneDir := filepath.Join(reposDir, "org-repo") // FLAT: no org/ directory level
+	if out, err := exec.Command("git", "clone", "-q", origin, cloneDir).CombinedOutput(); err != nil {
+		t.Fatalf("clone: %v\n%s", err, out)
+	}
+	pass, missing := resolveRepos(options{repos: reposDir}, []record{
+		{URL: "https://github.com/org/repo/pull/7"},
+	}, realGit, realGitRaw)
+	if missing != nil {
+		t.Fatalf("missing = %v; want the flat layout resolved", missing)
+	}
+	ev, err := pass.search("https://github.com/org/repo/pull/7", run.Finding{
+		File: "app/models/widget.rb", IssueText: "the widget polish path has no test asserting the shine"})
+	if err != nil || len(ev.Evidence) != 1 {
+		t.Errorf("evidence = %+v, %v; want the flat-layout clone searched", ev.Evidence, err)
 	}
 }

@@ -556,3 +556,23 @@ func firstTarget(recordTarget, fallback any) any {
 func nowISO() string {
 	return time.Now().UTC().Format(time.RFC3339Nano)
 }
+
+// Load returns the findings ledger's records — the read-only view callers like the push
+// gate reconcile against (issue #147). A repo with no ledger yet is empty, not an error,
+// matching Reconcile's own behavior.
+func Load(root string) ([]Record, error) {
+	return readJSONL(filepath.Join(root, ".metareview", "findings.jsonl"))
+}
+
+// IsResolvedTerminal reports whether a finding status is a RECOGNIZED terminal value:
+// fixed, override-granted, or superseded. It is an allowlist, not a denylist — a ledger
+// row with an unrecognized status (typo, empty, a future value an older reader receives)
+// is unvouched: reconciliation consumers must treat it as still blocking, never as
+// resolved (issue #147 review: a malformed row must not clear a gate).
+func IsResolvedTerminal(status string) bool {
+	switch status {
+	case "fixed", StatusOverridden, StatusSuperseded:
+		return true
+	}
+	return false
+}

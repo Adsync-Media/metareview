@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/dsifry/metareview/internal/findings"
+	"github.com/dsifry/metareview/internal/markdown"
 	"github.com/dsifry/metareview/internal/reviewlog"
 	"github.com/dsifry/metareview/internal/runchain"
 )
@@ -504,4 +505,147 @@ func normalizePath(path string) string {
 		return ""
 	}
 	return filepath.ToSlash(filepath.Clean(path))
+}
+
+// ---- issue #147: the shared log-reconciliation predicate ----
+//
+// The push gate and the pr-ready review must agree on when a review log's blockers are
+// historical. The predicate: a log with unresolved blockers is historical when EVERY
+// blocker-class finding it raised is resolved in the findings ledger (override-granted,
+// fixed, or superseded — IsBlockingClass only, at least one resolver required). Live
+// advisories never hold the gate closed, so they never resolve it either; unknown or
+// missing finding IDs resolve nothing (fail closed). The frozen log file is never
+// modified — the ledger is the live reconciliation authority.
+
+// ClassifyReviewFindings inspects the ledger rows a review references. anyBlocking
+// reports whether any blocker-class row still holds the gate closed; resolvers
+// describes how the cleared ones were resolved. Advisory-class rows are ignored: they
+// never appear in a blocker-status section, so they must not sway the verdict.
+func ClassifyReviewFindings(findingIDs []string, byID map[string]findings.Record) (resolvers []string, anyBlocking bool) {
+	for _, id := range findingIDs {
+		record, ok := byID[id]
+		if !ok || !findings.IsBlockingClass(record) {
+			continue
+		}
+		if findings.Blocks(record.Status) {
+			anyBlocking = true
+			continue
+		}
+		// Allowlist, not denylist: a row whose status is not a RECOGNIZED terminal
+		// value (typo, empty, a future value an older reader receives) is unvouched —
+		// it must keep the log blocking, never resolve it (issue #147 review).
+		if !findings.IsResolvedTerminal(record.Status) {
+			anyBlocking = true
+			continue
+		}
+		resolvers = append(resolvers, ResolverPhrase(record))
+	}
+	return resolvers, anyBlocking
+}
+
+// LogResolvedInLedger reports whether a log that blocks (HasUnresolvedBlockers) is
+// historical because every blocker-class finding it raised is resolved in the ledger.
+// STRICT on the gate's behalf: the ledger must vouch for EVERY finding ID the log
+// references — an ID it does not know is an unvouched blocker, never a resolved one
+// (issue #147 review: the mixed resolved+unknown case must stay blocking). prready's
+// report-prose rendering keeps its lenient reading on purpose: it renders, it does not
+// gate.
+func LogResolvedInLedger(log reviewlog.Summary, byID map[string]findings.Record) bool {
+	if !log.HasUnresolvedBlockers {
+		return false
+	}
+	vouched := 0
+	for _, id := range log.FindingIDs {
+		record, ok := byID[id]
+		if !ok {
+			return false // an ID the ledger does not know is an unvouched blocker
+		}
+		if findings.IsBlockingClass(record) && findings.IsResolvedTerminal(record.Status) {
+			vouched++
+		}
+	}
+	// The same pruned-reference tripwire as the escalation lift: the FindingIDs list is
+	// partly markdown-sourced, so a deleted reference hides a blocker from the check
+	// above; the unforgeable run record counted the blockers this run raised.
+	if log.BlockingFindingCount > 0 && vouched < log.BlockingFindingCount {
+		return false
+	}
+	resolvers, anyBlocking := ClassifyReviewFindings(log.FindingIDs, byID)
+	return !anyBlocking && len(resolvers) > 0
+}
+
+// EscalationLiftedByOverrides reports whether an ESCALATED log's hard stop is lifted by
+// an explicit recorded human decision: EVERY blocker-class finding it references carries
+// an override grant (grantor recorded). Fixes and superseded rows never lift an
+// escalation — LogBlocks documents an ESCALATED verdict as "a hard stop that a later
+// clean re-run must not erase", so only the override system's two-phase human decision
+// (requester ≠ grantor, grantor recorded) may end it. Advisory-class rows are ignored.
+func EscalationLiftedByOverrides(log reviewlog.Summary, byID map[string]findings.Record) bool {
+	if !log.HasUnresolvedBlockers {
+		return false
+	}
+	if len(log.FindingIDs) == 0 {
+		return false // nothing to vouch for: fail closed
+	}
+	// The run record is the unforgeable source. No HeadSHA means no run record merged —
+	// the forgeable markdown is then the only source for this log's blocker set, and a
+	// gate decision on it would be theater (issue #147 review: the pruned-markdown attack).
+	if log.HeadSHA == "" {
+		return false
+	}
+	vouched := 0
+	for _, id := range log.FindingIDs {
+		record, ok := byID[id]
+		if !ok {
+			return false // an ID the ledger does not know is an unvouched blocker (strict, like LogResolvedInLedger)
+		}
+		if !findings.IsBlockingClass(record) {
+			continue // advisory-class rows never held the gate
+		}
+		// Two-phase, enforced: only a grant that ACKNOWLEDGES A FILED REQUEST
+		// (OverrideRequestedBy recorded, requester ≠ grantor enforced by
+		// findings.GrantOverride) counts toward lifting the hard stop — and the request
+		// must have been filed against THIS escalation: the FindingIDs list is partly
+		// markdown-sourced (forgeable), so a legitimate grant for an unrelated finding
+		// must not vouch for a different run's hard stop.
+		if record.Status != findings.StatusOverridden || record.OverrideGrantedBy == "" || record.OverrideRequestedBy == "" || record.OverrideEscalation != log.RunID {
+			return false
+		}
+		vouched++
+	}
+	// Tripwire against the PRUNED-reference attack: the FindingIDs list is partly
+	// markdown-sourced, so deleting a reference hides a blocker from the loop above.
+	// The unforgeable run record counted the blockers this run raised; the vouched set
+	// must cover at least that many. (Carried-forward rows from ancestor runs are extra
+	// credit, not part of the count.)
+	if log.BlockingFindingCount > 0 && vouched < log.BlockingFindingCount {
+		return false
+	}
+	return true
+}
+
+// ResolverPhrase describes how a no-longer-blocking finding was cleared. Free text
+// (grantor, reason, run id) is run through markdown.PlainText so a value carrying
+// newlines or control characters cannot break out of its bullet and inject headings or
+// list items into a report that may be posted to a PR.
+func ResolverPhrase(record findings.Record) string {
+	switch record.Status {
+	case findings.StatusOverridden:
+		phrase := "override granted"
+		if by := markdown.PlainText(record.OverrideGrantedBy); by != "" {
+			phrase += " by " + by
+		}
+		if reason := markdown.PlainText(record.OverrideGrantReason); reason != "" {
+			phrase += " (" + reason + ")"
+		}
+		return phrase
+	case findings.StatusSuperseded:
+		return "superseded"
+	default:
+		// Fixed, or any other non-blocking terminal status.
+		if runID := markdown.PlainText(record.FixedInRunID); runID != "" {
+			return "fixed in run " + runID
+		}
+		return "resolved"
+	}
 }

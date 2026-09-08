@@ -17,6 +17,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/dsifry/metareview/internal/findings"
 	"github.com/dsifry/metareview/internal/repo"
 	"github.com/dsifry/metareview/internal/reviewlog"
 	"github.com/dsifry/metareview/internal/reviewstate"
@@ -82,6 +83,56 @@ func BuildFor(root, target string) (Report, error) {
 // result, and — worse than the waste — a test injecting a fake RunGit still shelled out to the
 // real git here, and an explicit --base never reached the currency check at all. Threading it
 // through keeps one answer to "what are this branch's commits" instead of two that can disagree.
+// loadFindings is the findings-ledger seam (the command-seam DI pattern): the push gate
+// reconciles log-level blockers against the ledger (issue #147), and the tests need to
+// reach the unreadable-ledger branch that reviewlog.Discover otherwise fails closed first.
+var loadFindings = findings.Load
+
+// reconcileLogsAgainstLedger returns the run IDs of logs whose log-level blockers the
+// findings ledger resolves (issue #147). A NEEDS_REVISION log clears when every
+// blocker-class finding it references is resolved in the ledger (fixed, override-granted,
+// superseded); an ESCALATED log — LogBlocks' documented hard stop — clears ONLY when
+// every blocker-class finding carries an explicit override grant, the recorded human
+// decision. Fail-closed: an unreadable ledger clears nothing and says so via warnings.
+func reconcileLogsAgainstLedger(root string, logs []reviewlog.Summary, warnings *[]string) map[string]bool {
+	ledger, err := loadFindings(root)
+	if err != nil {
+		*warnings = append(*warnings, "findings ledger unreadable, log-level reconciliation disabled: "+err.Error())
+		return map[string]bool{}
+	}
+	byID := map[string]findings.Record{}
+	for _, rec := range ledger {
+		byID[rec.ID] = rec
+	}
+	resolved := map[string]bool{}
+	for _, s := range logs {
+		if !reviewstate.LogBlocks(s) {
+			continue
+		}
+		// The reconciliation binds to the run record through the log's Run ID — scraped
+		// from the forgeable committed markdown. Only a run record that AUTHENTICATES the
+		// summary (its own recorded reviewLogPath is this file, plus scope/verdict/SHAs/
+		// digest agreement — reviewlog.localRunAuthenticatesSummary) may serve as the
+		// anchor: a re-labeled or hand-authored log inherits nothing and keeps blocking
+		// (issue #147 review: one markdown edit must not erase a real hard stop).
+		if !s.RunRecordAuthenticated {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(s.Verdict), "ESCALATED") {
+			// aligned with LogBlocks' own TrimSpace so the shared predicate and the
+			// dispatch cannot disagree on a padded verdict
+			if reviewstate.EscalationLiftedByOverrides(s, byID) {
+				resolved[s.RunID] = true
+			}
+			continue
+		}
+		if reviewstate.LogResolvedInLedger(s, byID) {
+			resolved[s.RunID] = true
+		}
+	}
+	return resolved
+}
+
 func buildFor(root, target string, current map[string]bool) (Report, error) {
 	rep := repo.Detect(root)
 	r := Report{
@@ -133,11 +184,15 @@ func buildFor(root, target string, current map[string]bool) (Report, error) {
 	for id := range reviewstate.StaleSameHeadRunIDs(logs) {
 		superseded[id] = true
 	}
+	resolved := reconcileLogsAgainstLedger(root, logs, &r.Warnings)
 	for _, s := range logs {
 		if !reviewstate.LogBlocks(s) { // unresolved blockers OR an ESCALATED verdict — one shared predicate
 			continue
 		}
 		if superseded[s.RunID] {
+			continue
+		}
+		if resolved[s.RunID] {
 			continue
 		}
 		if target != "" && !covers(s, target, current) {
@@ -497,8 +552,12 @@ func buildForBranch(root, base string, run RunGit, committedOnly bool) (Report, 
 	for id := range reviewstate.StaleSameHeadRunIDs(all) {
 		superseded[id] = true
 	}
+	resolved2 := reconcileLogsAgainstLedger(root, all, &r.Warnings)
 	for _, s := range scoped {
 		if !reviewstate.LogBlocks(s) || superseded[s.RunID] { // unresolved blockers OR ESCALATED — shared predicate
+			continue
+		}
+		if resolved2[s.RunID] {
 			continue
 		}
 		r.MustClear = append(r.MustClear, Blocker{

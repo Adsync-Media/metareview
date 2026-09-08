@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/dsifry/metareview/internal/claimcheck"
 	"github.com/dsifry/metareview/internal/fsm/run"
@@ -544,25 +545,42 @@ const gapClaimDisclosure = "[metareview: the finding claims tests, specs or cove
 	"This diff also changes the following test-shaped files, whose added lines reference the claimed subject; their hunks are appended below. " +
 	"Before accepting the claim, verify the claimed absence against them - a test that exists yet does not cover the claimed behavior still makes the claim true, but a test that does cover it makes the claim false.]\n"
 
+// gapClaimRepoDisclosure follows the diff-side one when the repository-head search found
+// covering-test candidates (issue #146): those files are NOT in the diff, so without the
+// disclosure the judge cannot tell what the appended full files are or where they came from.
+const gapClaimRepoDisclosure = "[metareview: the repository head was also searched for test-shaped files whose content references the claimed subject; " +
+	"the full (line-capped) content of each match is appended below and was NOT changed by this diff. " +
+	"Weigh it the same way: a repository test that covers the claimed behavior makes the claim false, one that does not leaves the claim real.]\n"
+
+// gapClaimRepoNone is appended when the repository search COMPLETED but found no
+// candidate. Only a completed search may say this - an error or a skipped search stays
+// silent, because silence is what the pre-#146 context looked like and a failed search
+// must never read as evidence of absence.
+const gapClaimRepoNone = "[metareview: the repository head was also searched for test-shaped files whose content references the claimed subject; none matched. " +
+	"Treat this as the search record the claim's confirmation rests on.]\n"
+
 // ContextForGapClaim is ContextForClaim for a finding whose claim class is testing-gap
-// (claimcheck.Detect): the primary file, the files the text names, AND the test files
-// whose added lines reference the claim's subject, with a disclosure naming them. The
+// (claimcheck.Detect): the primary file, the files the text names, the test files whose
+// added lines reference the claim's subject, AND - when repo is non-nil - the repository-
+// head candidates from the issue #146 search, with disclosures naming every source. The
 // cal.com failure (#140) was exactly a claim whose contradicting spec sat in the same
-// diff, eight lines below the change, and the judge was never shown it.
-func ContextForGapClaim(diff string, alreadyTruncated bool, f run.Finding, budget int) (out string, truncated bool, hash string, evidence []claimcheck.Evidence) {
+// diff, eight lines below the change, and the judge was never shown it; the #146 blind
+// spot was the covering test that lives OUTSIDE the diff entirely.
+func ContextForGapClaim(diff string, alreadyTruncated bool, f run.Finding, budget int, repo *RepoEvidence) (out string, truncated bool, hash string, evidence []claimcheck.Evidence) {
 	evidence = GapClaimEvidence(diff, f, MaxGapEvidenceFiles)
 	// Referenced paths and evidence paths are deduped by NORMALIZED value: a finding
 	// that names "b/spec/x.rb" while the evidence returns "spec/x.rb" names the same
 	// file, and the raw-key lookup would append its hunks twice (CodeRabbit #145).
 	var paths []string
 	inPaths := map[string]bool{}
-	addPath := func(p string) {
+	addPath := func(p string) bool {
 		key := NormalizePath(p)
 		if inPaths[key] {
-			return
+			return false
 		}
 		inPaths[key] = true
 		paths = append(paths, p)
+		return true
 	}
 	for _, p := range ReferencedPaths(diff, f.File, f.IssueText) {
 		addPath(p)
@@ -570,20 +588,98 @@ func ContextForGapClaim(diff string, alreadyTruncated bool, f run.Finding, budge
 	for _, e := range evidence {
 		addPath(e.Path)
 	}
+	// Repository candidates join the same normalized dedup. "The diff already carries this
+	// path" means CONTENT: the evidence's tokens must be visible in the hunks AS SHIPPED —
+	// a repo match on unchanged lines of a touched file renders no hunk line, and dropping
+	// its body would leave the judge with neither the covering assertion nor a search
+	// record while the audit claims the evidence was offered. The decision needs the share
+	// (the shipped render is share-sized), so it is deferred until the share is computed:
+	// candidates are collected first, decided after.
+	type repoCandidate struct {
+		path, body string
+		tokens     []string
+		addedNew   bool
+		inDiff     bool
+	}
+	coveredByHunks := func(p string, tokens []string, render int) bool {
+		// SelectDiff cannot render only when the path is not in the diff at all — both dedup
+		// sources guarantee it is (ReferencedPaths filters on DiffHasFile; diff evidence is
+		// built from the diff's own blocks). An empty sel then matches no token, which is
+		// the desired "not covered" answer, so no separate !ok branch exists to dead-spot.
+		sel, _, _ := SelectDiff(diff, p, 0, render)
+		low := strings.ToLower(sel)
+		concat := strings.ReplaceAll(low, "_", "")
+		for _, t := range tokens {
+			if strings.Contains(low, t) || strings.Contains(concat, strings.ReplaceAll(t, "_", "")) {
+				return true
+			}
+		}
+		return false
+	}
+	var candidates []repoCandidate
+	if repo != nil {
+		for _, e := range repo.Evidence {
+			if body, ok := repo.Content[e.Path]; ok {
+				c := repoCandidate{path: e.Path, body: body, tokens: e.Tokens, addedNew: addPath(e.Path), inDiff: DiffHasFile(diff, e.Path)}
+				candidates = append(candidates, c)
+			}
+		}
+		// every repo path is evidence for the audit trail, even one whose full content
+		// was skipped because the diff already shows its hunks
+		for _, e := range repo.Evidence {
+			addEvidencePath(&evidence, e.Path)
+		}
+	}
 	if len(paths) == 0 {
-		out, truncated, hash := ContextFor(diff, alreadyTruncated, f.File, f.Line, budget)
+		out, truncated, _ := ContextFor(diff, alreadyTruncated, f.File, f.Line, budget)
+		if repo != nil && repo.Ran && len(repo.Evidence) == 0 {
+			// Hash the context the judge actually receives — the disclosure is part of it.
+			out = gapClaimRepoNone + out
+			sum := sha1.Sum([]byte(out))
+			return out, truncated, hex.EncodeToString(sum[:]), evidence
+		}
+		_, _, hash := ContextFor(diff, alreadyTruncated, f.File, f.Line, budget)
 		return out, truncated, hash, evidence
 	}
-	// same split as ContextForClaim: the declared file keeps two shares of the budget,
-	// every corroborating file one.
-	share := budget / (len(paths) + 2)
+	// Same split as ContextForClaim, tightened for repo bodies: the declared file keeps
+	// two shares of the budget; every corroborating path one share of hunks; and EVERY
+	// repository candidate reserves one further share for a potential body — including
+	// deduped ones, because an in-diff path whose hunks do not render the match spends
+	// its hunk share AND a body share. With that reservation the aggregate can never
+	// exceed the caller's budget, and each body is CLIPPED to its share: a full head file
+	// is not bounded by the diff the way SelectDiff hunks are, and an unclipped body
+	// could push the context far past the budget while the truncated flag said complete.
+	share := budget / (len(paths) + len(candidates) + 2)
+	var repoFiles []repoFile
+	for _, c := range candidates {
+		if c.addedNew || !coveredByHunks(c.path, c.tokens, share) {
+			// newly added (the diff renders nothing for it) or the hunks do not render the
+			// matched content: the body carries the only view of the covering lines
+			repoFiles = append(repoFiles, repoFile{path: c.path, body: c.body, inDiff: c.inDiff})
+		}
+	}
 	// The primary's truncation flag is preserved, not inferred from byte length: a small
 	// elided block is easily outweighed by the disclosure and repeated file headers, which
 	// would send partial context to the adjudicator marked complete (CodeRabbit #145).
-	primary, primaryTruncated, _ := ContextFor(diff, alreadyTruncated, f.File, f.Line, budget-share*len(paths))
+	primary, primaryTruncated, _ := ContextFor(diff, alreadyTruncated, f.File, f.Line, budget-share*(len(paths)+len(repoFiles)))
+	bodyClipped := false
+	for i := range repoFiles {
+		clipped := clipBody(repoFiles[i].body, share)
+		if len(clipped) != len(repoFiles[i].body) {
+			bodyClipped = true
+		}
+		repoFiles[i].body = clipped
+	}
 	var b strings.Builder
 	if len(evidence) > 0 {
 		b.WriteString(gapClaimDisclosure)
+	}
+	if len(repoFiles) > 0 {
+		b.WriteString(gapClaimRepoDisclosure)
+	} else if repo != nil && repo.Ran && len(repo.Evidence) == 0 {
+		// The main path owes the same honesty as the early return: a completed search that
+		// found nothing is the search record the criterion asks the judge to cite.
+		b.WriteString(gapClaimRepoNone)
 	}
 	b.WriteString(primary)
 	for _, p := range paths {
@@ -591,7 +687,57 @@ func ContextForGapClaim(diff string, alreadyTruncated bool, f run.Finding, budge
 			b.WriteString("\n" + sel)
 		}
 	}
+	for _, rf := range repoFiles {
+		b.WriteString("\n" + rf.header() + rf.body)
+	}
 	out = b.String()
 	sum := sha1.Sum([]byte(out))
-	return out, alreadyTruncated || primaryTruncated, hex.EncodeToString(sum[:]), evidence
+	return out, alreadyTruncated || primaryTruncated || bodyClipped, hex.EncodeToString(sum[:]), evidence
+}
+
+// clipBody cuts a repository file's bounded content to at most n bytes, on a line
+// boundary where one fits, with an elision marker so the judge can tell the body was
+// cut rather than the file simply ending there. The cut never splits a multi-byte UTF-8
+// rune: an invalid rune in the prompt or the hashed context corrupts what the judge
+// reads and what the audit records.
+func clipBody(body string, n int) string {
+	if len(body) <= n {
+		return body
+	}
+	cut := body[:n]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	if i := strings.LastIndexByte(cut, '\n'); i > 0 {
+		cut = cut[:i+1]
+	}
+	return cut + "[metareview: repository file truncated at the context budget]\n"
+}
+
+// repoFile is one repository-head candidate the judge needs beyond the diff hunks: its
+// bounded full content, under a header whose provenance is CHECKED against the diff, not
+// asserted — a diff-touched file's hunks show only the changed lines, and the label must
+// say the full head content is what carries the rest.
+type repoFile struct {
+	path   string
+	body   string
+	inDiff bool
+}
+
+func (rf repoFile) header() string {
+	if rf.inDiff {
+		return "--- " + rf.path + " (repository head; also touched by this diff — the hunks above show only the changed lines, this body is the full head content) ---\n"
+	}
+	return "--- " + rf.path + " (repository head, unchanged by this diff) ---\n"
+}
+
+// addEvidencePath appends a path to the evidence list unless it is already there
+// (normalized), keeping the audit list one-entry-per-file.
+func addEvidencePath(evidence *[]claimcheck.Evidence, path string) {
+	for _, e := range *evidence {
+		if NormalizePath(e.Path) == NormalizePath(path) {
+			return
+		}
+	}
+	*evidence = append(*evidence, claimcheck.Evidence{Path: path})
 }

@@ -67,7 +67,12 @@ func RequestOverride(root, findingID string, request OverrideRequest) error {
 		return fmt.Errorf("override request needs a timestamp")
 	}
 	return mutateFinding(root, findingID, func(record *Record) error {
-		if record.Status != "open" {
+		// A FIXED finding enters the two-phase flow only when the request references the
+		// escalation whose hard stop it asks to lift (request.Escalation — issue #147):
+		// the run-level stop can outlive the finding-level fix, and the recorded request
+		// is what makes the later grant two-phase (requester ≠ grantor).
+		fixedWithEscalation := record.Status == "fixed" && strings.TrimSpace(request.Escalation) != ""
+		if record.Status != "open" && !fixedWithEscalation {
 			return fmt.Errorf("finding %s is %s, not open", findingID, record.Status)
 		}
 		record.Status = StatusOverridePending
@@ -81,9 +86,12 @@ func RequestOverride(root, findingID string, request OverrideRequest) error {
 }
 
 // GrantOverride acknowledges the exception. It accepts an open finding directly
-// (a human overriding without a prior agent escalation) or a pending request
-// filed by someone else. It refuses a grant from the actor that requested it:
-// requesting and acknowledging are separate roles by design.
+// (a human overriding without a prior agent escalation), a pending request
+// filed by someone else, or a FIXED finding whose run-level escalation persists —
+// lifting that escalation is a human decision the grant records (issue #147: the
+// run's hard stop outlives the finding-level fix). It refuses a grant from the
+// actor that requested it: requesting and acknowledging are separate roles by
+// design.
 //
 // By is audit metadata, not authentication — a local CLI has no authority to
 // verify an identity — so this enforces the boundary against the accidental
@@ -101,7 +109,12 @@ func GrantOverride(root, findingID string, grant OverrideGrant) error {
 		return fmt.Errorf("override grant needs a timestamp")
 	}
 	return mutateFinding(root, findingID, func(record *Record) error {
-		if record.Status != "open" && record.Status != StatusOverridePending {
+		// A FIXED finding enters the two-phase flow only when a REQUEST referencing the
+		// escalation was already filed (record.OverrideEscalation — issue #147): the
+		// run-level stop can outlive the finding-level fix, and lifting it is the human
+		// decision the grant records — with requester ≠ grantor enforced below.
+		fixedWithEscalation := record.Status == "fixed" && strings.TrimSpace(record.OverrideEscalation) != ""
+		if record.Status != "open" && !fixedWithEscalation && record.Status != StatusOverridePending {
 			return fmt.Errorf("finding %s is %s and cannot be overridden", findingID, record.Status)
 		}
 		if strings.EqualFold(by, record.OverrideRequestedBy) {

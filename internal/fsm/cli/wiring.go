@@ -45,16 +45,11 @@ func (c *ctxDeps) git(dir string, args ...string) (string, int, error) {
 	return strings.TrimSpace(string(out)), code, err
 }
 
-// gitCtx returns TRIMMED stdout and gitRawCtx returns it byte for byte; both take the context
-// explicitly, for callers handed one narrower than the invocation's. Never use the trimming form
-// for file content: the trim removes leading and trailing blank lines, shifting every line number
-// below them. Materializing this repository's own branch is ~540 files and so ~1,000 git
-// subprocesses; a caller that cancels must be able to stop them.
-func (c *ctxDeps) gitCtx(ctx context.Context, dir string, args ...string) (string, int, error) {
-	out, code, err := c.gitRawCtx(ctx, dir, args...)
-	return strings.TrimSpace(string(out)), code, err
-}
-
+// gitRawCtx returns stdout byte for byte, with the context explicit, for callers handed one
+// narrower than the invocation's. Never trim file content: the trim removes leading and
+// trailing blank lines, shifting every line number below them. Materializing this
+// repository's own branch is ~540 files and so ~1,000 git subprocesses; a caller that
+// cancels must be able to stop them.
 func (c *ctxDeps) gitRawCtx(ctx context.Context, dir string, args ...string) ([]byte, int, error) {
 	out, _, code, err := c.deps.Exec(ctx, dir, nil, args...)
 	return out, code, err
@@ -272,7 +267,7 @@ func (c *ctxDeps) machineDeps(root string, scenario *mockai.Scenario, mode judge
 	d := c.deps
 	// Symptom is the run's judge (real or mock): the §9.2 reviewer that vetoes a proven reproduction
 	// whose pre-fix failure is not the finding's own symptom.
-	kinds, _ := kind.New(kind.Deps{Judge: j, Mock: scenario != nil, Escalate: c.escalation(root, scenario, mode), Prove: kind.Provers{Mutation: kind.MutationProver{}, Reproduction: kind.ReproductionProver{Exec: d.Exec}}, Symptom: j}) // consistent by construction: a mock judge iff a scenario
+	kinds, _ := kind.New(kind.Deps{Judge: j, Mock: scenario != nil, Escalate: c.escalation(root, scenario, mode), RepoSearch: c.repoSearch(root, scenario, mode), Prove: kind.Provers{Mutation: kind.MutationProver{}, Reproduction: kind.ReproductionProver{Exec: d.Exec}}, Symptom: j}) // consistent by construction: a mock judge iff a scenario
 	md := machine.Deps{
 		Store: d.Store(root), Sidecar: d.Sidecar(root), Kinds: kinds,
 		Git:      func(dir string) gate.Git { return gate.NewExec(dir, d.Exec) },

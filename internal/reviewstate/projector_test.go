@@ -603,3 +603,247 @@ func TestPRReadyProjectionKeepsOnlyCurrentTargetLinkedFindingsBlocking(t *testin
 		t.Fatalf("unrelated blockers must remain visible as historical repository health: %+v", projection.HistoricalBlockers())
 	}
 }
+
+// ---- issue #147: the shared log-reconciliation predicate ----
+
+// A log's blocker-class findings, ALL resolved in the ledger (override-granted, fixed,
+// or superseded), make the log historical: the gate and pr-ready must agree on this with
+// ONE predicate, so it lives here.
+func TestLogResolvedInLedger(t *testing.T) {
+	blocked := func(ids ...string) reviewlog.Summary {
+		return reviewlog.Summary{RunID: "mrv-x", Verdict: "NEEDS_REVISION", HasUnresolvedBlockers: true, FindingIDs: ids}
+	}
+	overridden := findings.Record{ID: "f", Status: findings.StatusOverridden, Classification: "blocking", Severity: "high", OverrideGrantedBy: "boss", OverrideGrantReason: "accepted"}
+	fixed := findings.Record{ID: "f", Status: "fixed", Classification: "blocking", Severity: "high", FixedInRunID: "mrv-run-9"}
+
+	if !LogResolvedInLedger(blocked("f"), map[string]findings.Record{"f": overridden}) {
+		t.Error("an override-granted blocker must resolve the log")
+	}
+	if !LogResolvedInLedger(blocked("f"), map[string]findings.Record{"f": fixed}) {
+		t.Error("a fixed blocker must resolve the log")
+	}
+	// still-open blocker-class finding: anyBlocking keeps the log blocking
+	ledger := map[string]findings.Record{
+		"a": overridden,
+		"b": {ID: "b", Status: "open", Classification: "blocking", Severity: "high"},
+	}
+	if LogResolvedInLedger(blocked("a", "b"), ledger) {
+		t.Error("a still-open blocker-class finding must keep the log blocking")
+	}
+	// advisory-class rows never resolve blockers (they never held the gate closed)
+	if LogResolvedInLedger(blocked("f"), map[string]findings.Record{
+		"f": {ID: "f", Status: "open", Classification: "advisory", Severity: "low"},
+	}) {
+		t.Error("an advisory-class row must not resolve a blocking log")
+	}
+	// no finding IDs, or IDs unknown to the ledger: no resolvers, fail closed
+	if LogResolvedInLedger(blocked(), map[string]findings.Record{}) {
+		t.Error("a log with no finding IDs must stay blocking (fail closed)")
+	}
+	if LogResolvedInLedger(blocked("unknown"), map[string]findings.Record{"f": overridden}) {
+		t.Error("unknown finding IDs must stay blocking (fail closed)")
+	}
+	// a clean log is not "resolved" — it never blocked; the predicate is silent about it
+	if LogResolvedInLedger(reviewlog.Summary{RunID: "mrv-clean", Verdict: "PASS"}, nil) {
+		t.Error("a clean log must not be reported as ledger-resolved")
+	}
+	// superseded counts as a resolver
+	if !LogResolvedInLedger(blocked("f"), map[string]findings.Record{
+		"f": {ID: "f", Status: findings.StatusSuperseded, Classification: "blocking", Severity: "high"},
+	}) {
+		t.Error("a superseded blocker must resolve the log")
+	}
+	// the fixed resolver phrase names the run
+	resolvers, _ := ClassifyReviewFindings([]string{"f"}, map[string]findings.Record{"f": fixed})
+	if len(resolvers) != 1 || resolvers[0] != "fixed in run mrv-run-9" {
+		t.Errorf("resolvers = %v; want the fixed-in-run phrase", resolvers)
+	}
+	// a terminal status without a run id falls back to the generic phrase
+	resolvers, _ = ClassifyReviewFindings([]string{"f"}, map[string]findings.Record{
+		"f": {ID: "f", Status: "fixed", Classification: "blocking", Severity: "high"},
+	})
+	if len(resolvers) != 1 || resolvers[0] != "resolved" {
+		t.Errorf("resolvers = %v; want the generic resolved phrase", resolvers)
+	}
+	// issue #147 review blocker: an ID the ledger does not know is an unvouched blocker,
+	// never a resolved one — the mixed resolved+unknown case must stay blocking
+	if LogResolvedInLedger(blocked("f", "unknown"), map[string]findings.Record{"f": overridden}) {
+		t.Error("a mixed resolved+unknown ID set must stay blocking (unknown = unvouched)")
+	}
+	// a grant reason is carried into the phrase
+	resolvers, _ = ClassifyReviewFindings([]string{"f"}, map[string]findings.Record{
+		"f": {ID: "f", Status: findings.StatusOverridden, Classification: "blocking", Severity: "high", OverrideGrantedBy: "boss", OverrideGrantReason: "accepted for release"},
+	})
+	if len(resolvers) != 1 || resolvers[0] != "override granted by boss (accepted for release)" {
+		t.Errorf("resolvers = %v; want the full override phrase", resolvers)
+	}
+}
+
+// ClassifyReviewFindings is the classification half: resolver phrases for cleared
+// blocker-class rows, anyBlocking for rows that still hold the gate.
+func TestClassifyReviewFindings(t *testing.T) {
+	ledger := map[string]findings.Record{
+		"a": {ID: "a", Status: findings.StatusOverridden, Classification: "blocking", Severity: "high", OverrideGrantedBy: "boss"},
+		"b": {ID: "b", Status: "open", Classification: "blocking", Severity: "high"},
+		"c": {ID: "c", Status: "open", Classification: "advisory", Severity: "low"},
+	}
+	resolvers, anyBlocking := ClassifyReviewFindings([]string{"a", "b", "c", "unknown"}, ledger)
+	if !anyBlocking {
+		t.Error("the open blocker-class row must report anyBlocking")
+	}
+	if len(resolvers) != 1 || !strings.Contains(resolvers[0], "override granted by boss") {
+		t.Errorf("resolvers = %v; want the override phrase for a only", resolvers)
+	}
+}
+
+// An ESCALATED log's hard stop lifts ONLY by explicit override grants on every
+// blocker-class finding it references. Fixes and superseded rows never lift one
+// (LogBlocks: "a hard stop that a later clean re-run must not erase").
+func TestEscalationLiftedByOverrides(t *testing.T) {
+	escalated := func(ids ...string) reviewlog.Summary {
+		return reviewlog.Summary{RunID: "mrv-esc", Verdict: "ESCALATED", HasUnresolvedBlockers: true, FindingIDs: ids, HeadSHA: "abc1234def"}
+	}
+	// every lifting fixture carries a FILED request (OverrideRequestedBy): the two-phase
+	// invariant under test — the agent files, the human grants, requester ≠ grantor
+	override := findings.Record{ID: "f", Status: findings.StatusOverridden, Classification: "blocking", Severity: "high", OverrideRequestedBy: "agent", OverrideGrantedBy: "boss", OverrideGrantReason: "accepted", OverrideEscalation: "mrv-esc"}
+	fixed := findings.Record{ID: "f", Status: "fixed", Classification: "blocking", Severity: "high", FixedInRunID: "mrv-run-9"}
+	open := findings.Record{ID: "f", Status: "open", Classification: "blocking", Severity: "high"}
+
+	if !EscalationLiftedByOverrides(escalated("f"), map[string]findings.Record{"f": override}) {
+		t.Error("an explicit override grant on the only blocker-class finding lifts the escalation")
+	}
+	if EscalationLiftedByOverrides(escalated("f"), map[string]findings.Record{"f": fixed}) {
+		t.Error("a fix never lifts an escalation — only the recorded human decision does")
+	}
+	if EscalationLiftedByOverrides(escalated("f"), map[string]findings.Record{"f": open}) {
+		t.Error("an open blocker never lifts an escalation")
+	}
+	// one overridden, one fixed: not every blocker-class finding carries the human decision
+	if EscalationLiftedByOverrides(escalated("f", "g"), map[string]findings.Record{
+		"f": override,
+		"g": fixed,
+	}) {
+		t.Error("a mixed override+fix set must not lift the escalation")
+	}
+	// a grant without a grantor is not a recorded human decision
+	if EscalationLiftedByOverrides(escalated("f"), map[string]findings.Record{
+		"f": {ID: "f", Status: findings.StatusOverridden, Classification: "blocking", Severity: "high"},
+	}) {
+		t.Error("an override without a recorded grantor must not lift the escalation")
+	}
+	// advisory-class rows are ignored; the blocker-class one decides
+	if !EscalationLiftedByOverrides(escalated("f", "adv"), map[string]findings.Record{
+		"f":   override,
+		"adv": {ID: "adv", Status: "open", Classification: "advisory", Severity: "low"},
+	}) {
+		t.Error("an advisory row must not keep the escalation held")
+	}
+	// no finding IDs: fail closed
+	if EscalationLiftedByOverrides(escalated(), nil) {
+		t.Error("an escalated log with no finding IDs must stay blocking (fail closed)")
+	}
+	// unknown IDs are not vouched
+	if EscalationLiftedByOverrides(escalated("unknown"), map[string]findings.Record{"f": override}) {
+		t.Error("an unknown finding ID must not lift the escalation")
+	}
+	// the MIXED known-overridden + unknown shape must stay blocking — the exact hole the
+	// #147 review found: one vouched grant must not vouch for an unvouched sibling
+	if EscalationLiftedByOverrides(escalated("f", "unknown"), map[string]findings.Record{"f": override}) {
+		t.Error("a mixed overridden+unknown ID set must not lift the escalation (unknown = unvouched)")
+	}
+	// the two-phase invariant is enforced: only grants that acknowledge a FILED request
+	// (OverrideRequestedBy recorded) count toward lifting an escalation
+	if EscalationLiftedByOverrides(escalated("f"), map[string]findings.Record{
+		"f": {ID: "f", Status: findings.StatusOverridden, Classification: "blocking", Severity: "high", OverrideGrantedBy: "boss"},
+	}) {
+		t.Error("an override grant with no filed request (no OverrideRequestedBy) must not lift the escalation")
+	}
+	// ...but a grant acknowledging a filed request against THIS escalation does
+	if !EscalationLiftedByOverrides(escalated("f"), map[string]findings.Record{
+		"f": {ID: "f", Status: findings.StatusOverridden, Classification: "blocking", Severity: "high", OverrideRequestedBy: "agent", OverrideGrantedBy: "boss", OverrideGrantReason: "approved", OverrideEscalation: "mrv-esc"},
+	}) {
+		t.Error("a grant acknowledging a filed request lifts the escalation")
+	}
+}
+
+// The escalation lift is ANCHORED to the escalation: every vouching grant must have been
+// filed against THIS run (OverrideEscalation == the log's run ID). A legitimate grant for
+// an unrelated finding must not vouch for a different escalation — the FindingIDs list is
+// partly markdown-sourced (forgeable), so an agent could add an unrelated fully-granted
+// ID to an ESCALATED log and ride its grant.
+func TestEscalationLiftIsAnchoredToTheRun(t *testing.T) {
+	escalated := reviewlog.Summary{RunID: "mrv-esc-1", Verdict: "ESCALATED", HasUnresolvedBlockers: true, FindingIDs: []string{"f"}, HeadSHA: "abc1234def"}
+	// the grant was filed against a DIFFERENT escalation
+	unrelated := findings.Record{ID: "f", Status: findings.StatusOverridden, Classification: "blocking", Severity: "high", OverrideRequestedBy: "agent", OverrideGrantedBy: "boss", OverrideEscalation: "mrv-esc-OTHER"}
+	if EscalationLiftedByOverrides(escalated, map[string]findings.Record{"f": unrelated}) {
+		t.Error("a grant filed against a different escalation must not lift this one")
+	}
+	// no recorded escalation reference on the grant: not anchored, not vouching
+	unanchored := findings.Record{ID: "f", Status: findings.StatusOverridden, Classification: "blocking", Severity: "high", OverrideRequestedBy: "agent", OverrideGrantedBy: "boss"}
+	if EscalationLiftedByOverrides(escalated, map[string]findings.Record{"f": unanchored}) {
+		t.Error("a grant with no recorded escalation reference must not lift the escalation")
+	}
+	anchored := findings.Record{ID: "f", Status: findings.StatusOverridden, Classification: "blocking", Severity: "high", OverrideRequestedBy: "agent", OverrideGrantedBy: "boss", OverrideEscalation: "mrv-esc-1"}
+	if !EscalationLiftedByOverrides(escalated, map[string]findings.Record{"f": anchored}) {
+		t.Error("a grant filed against THIS escalation lifts it")
+	}
+}
+
+// The unforgeable run record's BlockingFindingCount is a tripwire against the pruned-
+// markdown attack: the FindingIDs list is partly markdown-sourced, so a reference DELETED
+// from the committed log leaves fewer vouched blocker-class rows than the run recorded as
+// blocking — the reconciliation must refuse. A run record that never existed (no
+// BlockingFindingCount, no HeadSHA) disables the reconciliation entirely: the forgeable
+// markdown is then the only source, and a gate decision on it would be theater.
+func TestReconciliationRefusesAPrunedReferenceList(t *testing.T) {
+	escalated := func(count int, head string) reviewlog.Summary {
+		return reviewlog.Summary{RunID: "mrv-esc", Verdict: "ESCALATED", HasUnresolvedBlockers: true,
+			FindingIDs: []string{"f"}, BlockingFindingCount: count, HeadSHA: head}
+	}
+	anchored := findings.Record{ID: "f", Status: findings.StatusOverridden, Classification: "blocking", Severity: "high", OverrideRequestedBy: "agent", OverrideGrantedBy: "boss", OverrideEscalation: "mrv-esc"}
+	// the run recorded TWO blockers; the (pruned) reference list vouches for one
+	if EscalationLiftedByOverrides(escalated(2, "abc1234def"), map[string]findings.Record{"f": anchored}) {
+		t.Error("vouched 1 of the run's recorded 2 blockers must not lift the escalation")
+	}
+	// vouched equals recorded: lifts
+	if !EscalationLiftedByOverrides(escalated(1, "abc1234def"), map[string]findings.Record{"f": anchored}) {
+		t.Error("vouched 1 of recorded 1 lifts the escalation")
+	}
+	// no run record (HeadSHA empty — the forgeable markdown is the only source): fail closed
+	if EscalationLiftedByOverrides(escalated(0, ""), map[string]findings.Record{"f": anchored}) {
+		t.Error("a log with no run record must not reconcile (the markdown is the only source)")
+	}
+	// the same tripwire on the NEEDS_REVISION predicate
+	needsRevision := reviewlog.Summary{RunID: "mrv-nr", Verdict: "NEEDS_REVISION", HasUnresolvedBlockers: true,
+		FindingIDs: []string{"f"}, BlockingFindingCount: 2, HeadSHA: "abc1234def"}
+	resolved := findings.Record{ID: "f", Status: findings.StatusOverridden, Classification: "blocking", Severity: "high", OverrideGrantedBy: "boss"}
+	if LogResolvedInLedger(needsRevision, map[string]findings.Record{"f": resolved}) {
+		t.Error("vouched 1 of recorded 2 must not resolve a NEEDS_REVISION log")
+	}
+	needsRevision.BlockingFindingCount = 1
+	if !LogResolvedInLedger(needsRevision, map[string]findings.Record{"f": resolved}) {
+		t.Error("vouched 1 of recorded 1 resolves the log")
+	}
+}
+
+// The resolution classification is an ALLOWLIST: a ledger row whose status is not a
+// recognized terminal value (typo'd, empty, future) is unvouched and keeps the log
+// blocking — a denylist would let a malformed row clear a gate.
+func TestClassifyReviewFindingsRejectsUnrecognizedStatus(t *testing.T) {
+	for _, status := range []string{"", "overridn", "resolved-ish", "OPEN"} {
+		resolvers, anyBlocking := ClassifyReviewFindings([]string{"f"}, map[string]findings.Record{
+			"f": {ID: "f", Status: status, Classification: "blocking", Severity: "high"},
+		})
+		if len(resolvers) != 0 || !anyBlocking {
+			t.Errorf("status %q: resolvers=%v anyBlocking=%v; want fail-closed (no resolver, blocking)", status, resolvers, anyBlocking)
+		}
+	}
+}
+
+// A non-blocking log (no unresolved blockers) is never "lifted" — the predicate is
+// silent about logs that never blocked.
+func TestEscalationLiftedByOverridesIgnoresCleanLogs(t *testing.T) {
+	if EscalationLiftedByOverrides(reviewlog.Summary{RunID: "mrv-clean", Verdict: "PASS"}, nil) {
+		t.Error("a clean log must not be reported as escalation-lifted")
+	}
+}
