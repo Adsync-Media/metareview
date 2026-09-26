@@ -52,15 +52,64 @@ PAYLOAD=""
 if [ ! -t 0 ]; then
   IFS= read -r -d "" -t 1 PAYLOAD || true
 fi
-LOOPING="$(printf '%s' "$PAYLOAD" | python3 -c '
+# Three fields, one per line: the loop flag, the session id, and the session's cwd. A value that
+# is not a string, or that contains a newline, is dropped rather than allowed to shift the lines.
+FIELDS="$(printf '%s' "$PAYLOAD" | python3 -c '
 import json, sys
 try:
-    print("yes" if json.load(sys.stdin).get("stop_hook_active") else "")
+    d = json.load(sys.stdin)
+    d = d if isinstance(d, dict) else {}
 except Exception:
-    print("")
+    d = {}
+def s(k):
+    v = d.get(k)
+    return v if isinstance(v, str) and "\n" not in v and "\r" not in v else ""
+print("yes" if d.get("stop_hook_active") else "")
+print(s("session_id"))
+print(s("cwd"))
 ' 2>/dev/null || true)"
+{ IFS= read -r LOOPING; IFS= read -r SESSION_ID; IFS= read -r HOST_CWD; } <<EOF || true
+$FIELDS
+EOF
 
-BIN="${METAREVIEW_BIN:-metareview}"
+# Where the session is. The payload's cwd is the host's own statement of it, so it wins over the
+# directory the host happened to start this process in. (A relative METAREVIEW_BIN is relative
+# to that original directory, so it is remembered first.)
+ORIG_PWD="$(pwd)"
+if [ -n "$HOST_CWD" ] && [ -d "$HOST_CWD" ]; then
+  cd "$HOST_CWD" 2>/dev/null || true
+fi
+
+# Find the binary the way the pre-push hook does. Plain `metareview` on PATH was the only lookup,
+# so a project that builds its own into ./bin, with nothing on PATH, got "not installed". PATH
+# still wins when it has one, exactly as in pre-push.
+BIN="${METAREVIEW_BIN:-}"
+if [ -z "$BIN" ]; then
+  TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if command -v metareview >/dev/null 2>&1; then
+    # The path PATH resolved, not the bare name: a relative PATH entry (`bin`) would otherwise
+    # name a different binary, or none, once the hook moves into a bound worktree.
+    BIN="$(command -v metareview)"
+    case "$BIN" in
+      /*) ;;
+      *) BIN="$PWD/$BIN" ;;
+    esac
+  elif [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -x "$CLAUDE_PROJECT_DIR/bin/metareview" ]; then
+    BIN="$CLAUDE_PROJECT_DIR/bin/metareview"
+  elif [ -n "$TOP" ] && [ -x "$TOP/bin/metareview" ]; then
+    BIN="$TOP/bin/metareview"
+  else
+    BIN="metareview"
+  fi
+fi
+
+# The hook changes directory again below (into a bound worktree), so a relative path would stop
+# naming the binary it was checked as: absolute from here on.
+case "$BIN" in
+  /*) ;;
+  */*) BIN="$ORIG_PWD/$BIN" ;;
+esac
+
 if ! command -v "$BIN" >/dev/null 2>&1; then
   # Absent tooling is reported, never treated as a pass: a check that did not run must not read
   # as a check that found nothing wrong.
@@ -73,6 +122,38 @@ if ! command -v "$BIN" >/dev/null 2>&1; then
   printf '{"decision":"block","reason":"metareview is not installed, so the review gate could not run. Install it or unset the hook deliberately."}\n'
   exit 0
 fi
+
+# The session may be bound to another worktree of this repository: the host reports the checkout
+# it LAUNCHED in, and a session opened on main that works in a sibling worktree was evaluated
+# against main on every turn — blocked on files it never touched, with no way to clear them.
+# `metareview session resolve` answers from the binding (or with this checkout when there is
+# none). An older CLI without `session` fails here and the hook simply stays where it is; its
+# usage error is not the operator's business. A warning from a CLI that DID answer is.
+LAUNCHED="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
+LAUNCHED="$(cd "$LAUNCHED" 2>/dev/null && pwd -P || printf '%s' "$LAUNCHED")"
+BOUND=""
+CHECKED=""
+# Asked even without a session id: resolve prints the root status will evaluate (which honours
+# nested metareview markers the git toplevel does not), so the reason names what was checked.
+# "bound" on its second line is the ONLY evidence of a binding — never inferred from paths.
+RES_ERR="$(mktemp "${TMPDIR:-/tmp}/metareview-resolve.XXXXXX" 2>/dev/null || true)"
+if RESOLVED="$("$BIN" session resolve ${SESSION_ID:+"$SESSION_ID"} 2>"${RES_ERR:-/dev/null}")"; then
+  [ -n "$RES_ERR" ] && [ -s "$RES_ERR" ] && cat "$RES_ERR" >&2
+  { IFS= read -r RES_DIR; IFS= read -r RES_MARK; } <<EOF || true
+$RESOLVED
+EOF
+  if [ -n "$RES_DIR" ] && [ -d "$RES_DIR" ] && cd "$RES_DIR" 2>/dev/null; then
+    CHECKED="$(pwd -P)"
+    [ "${RES_MARK:-}" = "bound" ] && BOUND="yes"
+  fi
+fi
+[ -n "$RES_ERR" ] && rm -f "$RES_ERR"
+if [ -z "$CHECKED" ]; then
+  CHECKED="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
+  CHECKED="$(cd "$CHECKED" 2>/dev/null && pwd -P || printf '%s' "$CHECKED")"
+fi
+BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+export MRV_CHECKED="$CHECKED" MRV_BRANCH="$BRANCH" MRV_SESSION_ID="$SESSION_ID" MRV_BOUND="$BOUND"
 
 # stdout ONLY. Capturing 2>&1 merged any diagnostic the CLI writes into the JSON, so json.load
 # failed and the reason degraded silently to the static fallback — losing the blocker names the
@@ -92,7 +173,7 @@ CODE=$?
 # crashed on the second pass silently bypassed completion enforcement altogether.
 if [ "$CODE" -eq 1 ] && [ -n "$LOOPING" ]; then
   # Second pass: the host is already continuing because of this hook. Yield, loudly.
-  printf 'metareview: yielding after a repeated block — the gate was not satisfied.\n' >&2
+  printf 'metareview: yielding after a repeated block — the gate was not satisfied in %s.\n' "$CHECKED" >&2
   printf '%s' "$OUT" | python3 -c '
 import json, sys
 try:
@@ -111,7 +192,13 @@ print("metareview: clear them, or record one with `metareview override request`.
 fi
 
 if [ "$CODE" -eq 0 ]; then
-  exit 0   # nothing to clear: the host proceeds
+  # Nothing to clear: the host proceeds. A pass in a BOUND worktree is still announced — a binding
+  # moves the gate off the launch checkout, and one chosen to dodge its blockers must be visible.
+  if [ -n "$BOUND" ]; then
+    printf 'metareview: passed in bound worktree %s%s for session %s; the launch checkout %s was not evaluated.\n' \
+      "$CHECKED" "${BRANCH:+ (branch $BRANCH)}" "$SESSION_ID" "$LAUNCHED" >&2
+  fi
+  exit 0
 fi
 
 # Exit 1 means "something must be cleared". Anything else is a failure of the check itself, and
@@ -129,7 +216,7 @@ if [ "$CODE" -eq 1 ]; then
   # runs on) produced invalid JSON, and the host cannot act on a block decision it cannot parse:
   # the gate fails open at exactly the moment it is trying to close.
   RESPONSE="$(printf '%s' "$OUT" | python3 -c '
-import json, sys
+import json, os, re, sys
 
 def reason(r):
     items = r.get("must_clear") or []
@@ -142,13 +229,32 @@ def reason(r):
     extra = "" if len(items) == 1 else " (and %d more)" % (len(items) - 1)
     return " on %s [%s]%s" % (first.get("target", "?"), first.get("verdict", "?"), extra)
 
+def where():
+    # WHICH checkout was evaluated. A session launched on one checkout and working in another
+    # read these blockers as its own; naming the checkout makes the mismatch visible, and the
+    # session id (from the host payload) lets the reason quote the exact command that fixes it.
+    checked = os.environ.get("MRV_CHECKED", "")
+    branch = os.environ.get("MRV_BRANCH", "")
+    sid = os.environ.get("MRV_SESSION_ID", "")
+    if not checked:
+        return ""
+    text = " Evaluated %s%s." % (checked, " (branch %s)" % branch if branch else "")
+    if os.environ.get("MRV_BOUND"):
+        text += " Session %s is bound to this worktree; `metareview session unbind %s` undoes it." % (sid, sid)
+    elif re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", sid):
+        # Only an id `session bind` would accept is quoted into a command the agent may run.
+        text += (" If the work of this session is in another worktree of this repository, run"
+                 " `metareview session bind %s <worktree-path>` so this check evaluates that worktree"
+                 " (its own pending reviews still apply)." % sid)
+    return text
+
 try:
     summary = reason(json.load(sys.stdin))
 except Exception:
     summary = ""
 print(json.dumps({
     "decision": "block",
-    "reason": "metareview has unresolved blockers%s. Run `metareview status --json` to see what must be cleared, fix them, or record a process override with a reason." % summary,
+    "reason": "metareview has unresolved blockers%s. Run `metareview status --json` to see what must be cleared, fix them, or record a process override with a reason.%s" % (summary, where()),
 }))
 ' 2>/dev/null)"
   # If python is missing or died, still block — with a valid, static response. Failing to describe
