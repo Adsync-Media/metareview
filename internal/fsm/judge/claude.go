@@ -79,6 +79,15 @@ func (j *claudeJudge) Call(ctx context.Context, r Request) (v Verdict, err error
 		// remains a denial rather than a hang in a headless run.
 		"--disallowed-tools", "*",
 		"--permission-mode", "dontAsk",
+		// Behind the isolated working directory (isolatedDir): load the user's settings only,
+		// never a project's or a local override, and no MCP server that is not passed explicitly
+		// (none is). --bare would also skip hooks but skips the keychain, and with it the OAuth
+		// session this transport exists to use.
+		"--setting-sources", "user",
+		"--strict-mcp-config",
+		// A judge call is not a session: nothing to resume, and with a fresh directory per
+		// attempt a saved transcript would leave one project directory behind per call.
+		"--no-session-persistence",
 		// The system prompt must always be passed. Without it `claude -p` can
 		// silently fall back to Haiku for the work turn even with --model set —
 		// the judge would then be a different model than the one recorded in the
@@ -105,9 +114,17 @@ func (j *claudeJudge) Call(ctx context.Context, r Request) (v Verdict, err error
 			case <-j.clock.After(backoff(classBackoff, attempt-1)):
 			}
 		}
-		actx, cancel := context.WithTimeout(ctx, j.timeout())
-		stdout, code, execErr := j.exec(actx, "", args, user)
-		cancel()
+		dir, cleanup, dirErr := isolatedDir()
+		if dirErr != nil {
+			lastErr = errs.E(CodeJudgeTransport, "claude could not be given an isolated working directory: "+dirErr.Error(), "provider", "claude-cli")
+			continue
+		}
+		stdout, code, execErr := func() ([]byte, int, error) {
+			defer cleanup() // deferred: a panic in the seam must not leave the directory behind
+			actx, cancel := context.WithTimeout(ctx, j.timeout())
+			defer cancel()
+			return j.exec(actx, dir, args, user)
+		}()
 
 		text, tokens, found, transient := parseClaudeResult(stdout)
 		v.Tokens = v.Tokens.Add(tokens)
