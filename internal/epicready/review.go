@@ -55,6 +55,7 @@ type runRecord struct {
 	AttemptNumber        int                 `json:"attemptNumber"`
 	MaxAttempts          int                 `json:"maxAttempts"`
 	BaseSHA              string              `json:"baseSha"`
+	RequestedBase        string              `json:"requestedBase,omitempty"`
 	HeadSHA              string              `json:"headSha"`
 	ContextPath          string              `json:"contextPackPath"`
 	ReviewPath           string              `json:"reviewLogPath"`
@@ -217,6 +218,7 @@ func Create(root, target string, options Options) (Result, error) {
 			AttemptNumber:        chain.AttemptNumber,
 			MaxAttempts:          chain.MaxAttempts,
 			BaseSHA:              git.BaseSHA,
+			RequestedBase:        git.RequestedBase,
 			HeadSHA:              git.HeadSHA,
 			ContextPath:          contextRel,
 			ReviewPath:           reviewRel,
@@ -565,6 +567,7 @@ func contextMarkdown(runID string, epic epicsource.Source, children []tasksource
 		"## Children\n\n" + childrenMarkdown(children) + "\n\n" +
 		"## Git\n\n" +
 		"- Base: " + markdown.InlineCode(git.BaseSHA) + "\n" +
+		markdown.OptionalListItem("Requested base", git.RequestedBase) +
 		"- Head: " + markdown.InlineCode(git.HeadSHA) + "\n" +
 		"- Branch: " + markdown.InlineCode(git.Branch) + "\n" +
 		"- Gate effect: " + markdown.InlineCode(gateEffect) + "\n\n" +
