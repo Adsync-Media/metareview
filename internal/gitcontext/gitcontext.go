@@ -324,6 +324,13 @@ func resolveBase(root, requestedBase string) (string, error) {
 			return out, err == nil, err // a timeout or an operational failure aborts
 		}, requestedBase)
 	}
+	base, _, err := defaultBase(root)
+	return base, err
+}
+
+// defaultBase is the base with no --base: the fork point from main, then master (forked=true), else HEAD~1
+// (forked=false) — on the default branch itself, or with neither branch.
+func defaultBase(root string) (base string, forked bool, err error) {
 	// These two run BEFORE the loop, and discarding their errors undid the guard below twice
 	// over: a stuck git burned two more full deadlines before the abort could fire, and — worse —
 	// a timed-out `rev-parse HEAD` left head empty, so `base != head` was trivially true and
@@ -331,11 +338,11 @@ func resolveBase(root, requestedBase string) (string, error) {
 	// check exists to prevent, restored by the very stall the deadline exists to catch.
 	head, err := git(root, "rev-parse", "HEAD")
 	if errors.Is(err, ErrTimeout) {
-		return "", err
+		return "", false, err
 	}
 	branch, err := git(root, "rev-parse", "--abbrev-ref", "HEAD")
 	if errors.Is(err, ErrTimeout) {
-		return "", err
+		return "", false, err
 	}
 	for _, name := range []string{"main", "master"} {
 		base, err := git(root, "merge-base", "HEAD", name)
@@ -345,13 +352,13 @@ func resolveBase(root, requestedBase string) (string, error) {
 			// the synchronous Stop gate for triple the bound it was given — and worse, a repo
 			// slow enough to time out on `merge-base main` but not on `HEAD~1` would resolve the
 			// WRONG base and silently scope the branch to one commit.
-			return "", err
+			return "", false, err
 		}
 		if err != nil || base == "" {
 			continue
 		}
 		if base != head {
-			return base, nil
+			return base, true, nil
 		}
 		// The merge base IS this commit, and the two cases that produce that are opposite.
 		//
@@ -368,16 +375,16 @@ func resolveBase(root, requestedBase string) (string, error) {
 		if branch == name {
 			break
 		}
-		return base, nil
+		return base, true, nil
 	}
-	base, err := git(root, "rev-parse", "HEAD~1")
+	base, err = git(root, "rev-parse", "HEAD~1")
 	if errors.Is(err, ErrTimeout) {
-		return "", err
+		return "", false, err
 	}
 	if err == nil && base != "" {
-		return base, nil
+		return base, false, nil
 	}
-	return "", fmt.Errorf("invalid git base: unable to resolve default base")
+	return "", false, fmt.Errorf("invalid git base: unable to resolve default base")
 }
 
 func validateRef(ref string) error {
@@ -605,4 +612,51 @@ func untrackedExcerpt(rel, text string) string {
 		lines[i] = "+" + line
 	}
 	return "--- " + rel + "\n" + strings.Join(lines, "\n")
+}
+
+// Head returns the commit HEAD names.
+func Head(root string) (string, error) {
+	return git(root, "rev-parse", "HEAD")
+}
+
+// IsAncestor reports whether ancestor is an ancestor of (or equal to) descendant. git's "no" (exit 1) is false; any
+// other failure — an unknown commit, a timeout — is an error.
+func IsAncestor(root, ancestor, descendant string) (bool, error) {
+	_, err := git(root, "merge-base", "--is-ancestor", ancestor, descendant)
+	var exit *gitExitError
+	if errors.As(err, &exit) && exit.code == 1 {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// ForkPoint returns where HEAD forked from main or master, and false when there is no such point (HEAD is on
+// the default branch or reachable from main, or neither branch exists) — the default base's HEAD~1 fallback, or
+// HEAD itself, is never a fork point.
+func ForkPoint(root string) (string, bool, error) {
+	base, forked, err := defaultBase(root)
+	if forked {
+		// HEAD itself (a detached main tip, a branch fast-forwarded into main) is where this work starts, not a
+		// point it forked from: a review over any base would "reach" it.
+		head, headErr := git(root, "rev-parse", "HEAD")
+		if headErr == nil && base != head {
+			return base, true, nil
+		}
+		return "", false, headErr
+	}
+	if errors.Is(err, ErrTimeout) {
+		return "", false, err // a stall aborts; a missing HEAD~1 just means no fork point either
+	}
+	return "", false, nil
+}
+
+// CommitExists reports whether sha names a commit in this repository. git's "no" (exit 1) is false; any other
+// failure is an error.
+func CommitExists(root, sha string) (bool, error) {
+	_, err := git(root, "rev-parse", "--verify", "--quiet", "--end-of-options", sha+"^{commit}")
+	var exit *gitExitError
+	if errors.As(err, &exit) && exit.code == 1 {
+		return false, nil
+	}
+	return err == nil, err
 }

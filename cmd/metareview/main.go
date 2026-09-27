@@ -123,7 +123,11 @@ Usage:
   metareview review pr-ready [--base <ref>] [--previous-run <run-id>] [--max-attempts <n>] [--evidence <path>] [--mutation-report <path>]... [--mutation-view <name>]... [--github-pr <number>] [--include-working-tree] [--shard-result <path>]... [--cross-shard-result <path>]
   METAREVIEW_MUTATION_FRESHNESS=advisory|enforce  freshness of --mutation-report evidence (docs/mutation-harness.md)
   metareview review record-lenses [--scope pr-ready|task-done|epic-ready] [--base <ref>] [--verdict <v>] [--mode subagent-adjudicated|in-session-emulated] [--lenses a,b,c] [--from-run <fsm-run-id>]
+  metareview review checkpoint --scope pr-ready|task-done|epic-ready
   metareview learn --post-merge <pr-number> [--base <ref>] [--github-pr <number>] [--session-root <path>]
+
+  --base last-reviewed (task-done, epic-ready, pr-ready, record-lenses) reviews only what is new since the
+  last passing review of that scope: the head printed by 'review checkpoint'.
 
 Commands:
   setup --check              Detect repository mode and prerequisites without writing files
@@ -147,6 +151,7 @@ Commands:
   review epic-ready <target> Run epic-ready integration review
   review pr-ready            Run PR-ready branch review
   review record-lenses       Record an adjudicated lens review over HEAD (satisfies the require-lenses gate)
+  review checkpoint          Print the head of the last passing review of a scope on an ancestor of HEAD
   learn --post-merge         Curate post-merge repository learning
 `, version.Version)
 }
@@ -351,6 +356,8 @@ func dispatch(args []string) {
 			}
 		}
 		mustMutationViews(options.MutationReportPaths, options.MutationViews)
+		options.Incremental = options.Base == reviewstate.LastReviewedBase
+		options.Base = resolveBaseToken("task-done", options.Base)
 		result, err := taskdone.Create(workdir, args[2], options)
 		exitOnErr(err)
 		_, _ = fmt.Fprintln(stdout, result.ReviewRel)
@@ -390,6 +397,8 @@ func dispatch(args []string) {
 			}
 		}
 		mustMutationViews(options.MutationReportPaths, options.MutationViews)
+		options.Incremental = options.Base == reviewstate.LastReviewedBase
+		options.Base = resolveBaseToken("epic-ready", options.Base)
 		result, err := epicready.Create(workdir, args[2], options)
 		exitOnErr(err)
 		_, _ = fmt.Fprintln(stdout, result.ReviewRel)
@@ -424,6 +433,25 @@ func dispatch(args []string) {
 			label = label[:12]
 		}
 		_, _ = fmt.Fprint(stdout, reviewprompt.Build(label, scope.Files, status.ChangeKinds(root, scope.Base, nil)))
+		exit(0)
+	}
+	if len(args) >= 2 && args[0] == "review" && args[1] == "checkpoint" {
+		scope := ""
+		for i := 2; i < len(args); i++ {
+			switch args[i] {
+			case "--scope":
+				scope = flagValue(args, i, "--scope")
+				i++
+			default:
+				_, _ = fmt.Fprintf(stderr, "Unknown option: %s\n", args[i])
+				exit(2)
+			}
+		}
+		if scope != "pr-ready" && scope != "task-done" && scope != "epic-ready" {
+			_, _ = fmt.Fprintln(stderr, "review checkpoint: --scope must be pr-ready, task-done, or epic-ready")
+			exit(2)
+		}
+		_, _ = fmt.Fprintln(stdout, resolveBaseToken(scope, reviewstate.LastReviewedBase))
 		exit(0)
 	}
 	if len(args) >= 2 && args[0] == "review" && args[1] == "record-lenses" {
@@ -467,8 +495,11 @@ func dispatch(args []string) {
 			exit(2)
 		}
 		root := repo.RootOr(workdir)
-		gc, err := gitcontext.Collect(root, base)
+		gc, err := gitcontext.Collect(root, resolveBaseToken(scope, base))
 		exitOnErr(err) // a repo with no HEAD/base fails here ("invalid git base"), so gc.HeadSHA is non-empty below
+		if base == reviewstate.LastReviewedBase {
+			gc.RequestedBase = base // the marker records the token it was asked for, beside the checkpoint SHA
+		}
 		// A CLI seam cannot witness that independent subagents actually ran, so it must not let a hand-typed
 		// `--mode subagent-adjudicated` launder a self-attested review as independent, full-strength evidence
 		// (the gate would then trust it with no advisory trace). subagent-adjudicated is therefore admitted
@@ -611,6 +642,8 @@ func dispatch(args []string) {
 			}
 		}
 		mustMutationViews(options.MutationReportPaths, options.MutationViews)
+		options.Incremental = options.Base == reviewstate.LastReviewedBase
+		options.Base = resolveBaseToken("pr-ready", options.Base)
 		result, err := prready.Create(workdir, options)
 		exitOnErr(err)
 		_, _ = fmt.Fprintln(stdout, result.ReviewRel)
@@ -830,6 +863,40 @@ func isPassingReviewOutcome(o fsmrun.Outcome) bool {
 func short(sha string) string {
 	if len(sha) > 12 {
 		return sha[:12]
+	}
+	return sha
+}
+
+// resolveBaseToken turns the reserved `--base last-reviewed` into the scope's checkpoint (#176) — the nearest head
+// on this branch whose latest review passed and whose reviews reach back to the fork point, read from the markers
+// recorded in this checkout (reviewstate.Checkpoint); any other base is returned unchanged.
+// With no such review there is nothing to be incremental from: exit 2 naming the problem, before anything is
+// recorded.
+func resolveBaseToken(scope, base string) string {
+	if base != reviewstate.LastReviewedBase {
+		return base
+	}
+	root := repo.RootOr(workdir)
+	head, err := gitcontext.Head(root)
+	exitOnErr(err)
+	forkPoint, forked, err := gitcontext.ForkPoint(root)
+	exitOnErr(err)
+	if !forked {
+		_, _ = fmt.Fprintf(stderr, "--base %s: HEAD has no fork point — there is no local main or master, or HEAD has no commits of its own past it (a detached main tip, a branch already in main) — so no review can be shown to cover the whole branch; pass an explicit --base\n", reviewstate.LastReviewedBase)
+		exit(2)
+	}
+	sha, ok, err := reviewstate.Checkpoint(root, scope, head, forkPoint, func(ancestor, descendant string) (bool, error) {
+		// A marker's head or base that no longer exists here (a rebased head pruned by gc, runs.jsonl copied from
+		// another clone) is simply not an ancestor, not a fatal error.
+		if exists, err := gitcontext.CommitExists(root, ancestor); err != nil || !exists {
+			return false, err
+		}
+		return gitcontext.IsAncestor(root, ancestor, descendant)
+	})
+	exitOnErr(err)
+	if !ok {
+		_, _ = fmt.Fprintf(stderr, "--base %s: no passing %s review on an ancestor of HEAD covers the branch back to its fork point (a later NEEDS_REVISION, a narrow --base, or a marker with no recorded base does not); review from the fork point first (e.g. --base main)\n", reviewstate.LastReviewedBase, scope)
+		exit(2)
 	}
 	return sha
 }
