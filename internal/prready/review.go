@@ -292,7 +292,7 @@ func Create(root string, options Options) (Result, error) {
 		Scope:            "pr-ready",
 		Target:           targetRecord,
 		PreviousRunIDs:   previousRunIDs,
-		HistoricalRunIDs: historicalPRReadyRunIDsForCurrentTarget(root, logs, targetRecord, git),
+		HistoricalRunIDs: append(historicalPRReadyRunIDsForCurrentTarget(root, logs, targetRecord, git), reviewstate.FlagTargetRunIDs(logs)...),
 		ChangedPaths:     reviewedPaths(analysisGit),
 		CurrentTarget:    targetRecord,
 		LinkedTargets:    linkedTargets,
@@ -729,6 +729,7 @@ func historicalPRReadyRunIDsForCurrentTarget(root string, logs []reviewlog.Summa
 	}
 	return ids
 }
+
 func legacyEscalatedPRReadyForTarget(root string, logs []reviewlog.Summary, targetRecord map[string]string, git gitcontext.Context) (string, bool) {
 	for _, log := range logs {
 		if log.RunID == "" || log.Kind != "pr-ready" || !strings.EqualFold(log.Verdict, "ESCALATED") {

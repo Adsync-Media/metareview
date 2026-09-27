@@ -148,6 +148,10 @@ func buildFor(root, target string, current map[string]bool) (Report, error) {
 	if err != nil {
 		return r, err
 	}
+	// A review recorded against the target --help/-h (#187) was never a review of work: it neither blocks nor
+	// answers for the paths it listed. Dropped here, before any scoping, so the target, branch and unscoped reports
+	// all agree with pr-ready, which retires the same runs through the same predicate.
+	logs = dropRuns(logs, reviewstate.FlagTargetRunIDs(logs))
 	// Scoping narrows the whole report, not just must_clear. A document that says
 	// `"target": "t-1"` while listing every other target's reviews invites the reader to think
 	// they are seeing everything, which is the misreading the field exists to prevent.
@@ -703,4 +707,19 @@ func covers(s reviewlog.Summary, target string, current map[string]bool) bool {
 		}
 	}
 	return false
+}
+
+// dropRuns returns logs without the named runs.
+func dropRuns(logs []reviewlog.Summary, ids []string) []reviewlog.Summary {
+	drop := map[string]bool{}
+	for _, id := range ids {
+		drop[id] = true
+	}
+	kept := logs[:0:0]
+	for _, s := range logs {
+		if !drop[s.RunID] {
+			kept = append(kept, s)
+		}
+	}
+	return kept
 }

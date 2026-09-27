@@ -52,9 +52,35 @@ func OSDeps() Deps {
 type Header struct {
 	Scope    string
 	TargetID string
-	Base     string
-	Head     string
-	Budget   int
+	// Target is the target argument the review was run with (task-done, epic-ready); "" for pr-ready. The Re-run
+	// command must repeat it: TargetID is a resolved id, not necessarily what the CLI accepts.
+	Target string
+	Base   string
+	Head   string
+	Budget int
+}
+
+// rerunCommand is the command a pack tells an agent to run once the shard results are written: the same review,
+// with the target it was run for (#187: without it the CLI took '--base' as the target). The run id is not part of
+// it — packs must stay byte-reproducible across runs — so the pack tells the agent to add --previous-run.
+func rerunCommand(h Header) string {
+	cmd := "metareview review " + h.Scope
+	if h.Target != "" {
+		cmd += " " + shellQuote(h.Target)
+	}
+	return cmd + " --base " + h.Base
+}
+
+// shellQuote returns s as one POSIX shell word. Anything outside a plain path alphabet is single-quoted — the only
+// quoting in which the shell expands nothing ($, backticks, globs, ;, & stay literal) — with a quote inside written
+// as '\”.
+func shellQuote(s string) string {
+	for _, r := range s {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && !strings.ContainsRune("_./:@%+=,-", r) {
+			return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+		}
+	}
+	return s
 }
 
 // Found is the outcome of one discovery pass over a target's result directory.
@@ -524,8 +550,10 @@ func shardPack(plan contextprofile.ShardPlan, shard contextprofile.Shard, header
 	b.WriteString("\n## Review\n\nReview the diff below against `rubrics/task-done-review-rubric.md`. ")
 	b.WriteString("Report findings with file:line evidence.\n\n")
 	b.WriteString("## Result contract\n\n" + resultContractFor(false) + "\n\n")
-	b.WriteString("## Re-run\n\n" +
-		markdown.InlineCode(fmt.Sprintf("metareview review %s --base %s", header.Scope, header.Base)) + "\n\n")
+	// A fenced block keeps the command byte-exact; an inline code span would flatten a newline in the target.
+	b.WriteString("## Re-run\n\n" + markdown.FencedCodeBlock("sh", rerunCommand(header)) + "\n\n" +
+		"Add `--previous-run <run-id>` with the run id this gate printed, and the same `--evidence` (and any " +
+		"mutation) options the gate was run with.\n\n")
 	for _, c := range shard.Chunks {
 		text := files[c.Path].Diff[c.ByteStart:c.ByteEnd]
 		fmt.Fprintf(&b, "### %s (part %d/%d)\n\n", markdown.InlineCode(c.Path), c.Part, c.Parts)
