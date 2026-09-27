@@ -59,6 +59,7 @@ const (
 	StatusEscalated      = "escalated"
 )
 
+// root: store — the terminal row is store-level: run ids are unique across the store, and Exists checks it.
 func path(root string) string { return filepath.Join(root, ".metareview", "runs.jsonl") }
 
 // RowFor maps a terminal view to its row (spec 3 §6).
@@ -85,6 +86,7 @@ func RowFor(v machine.View, now run.Time) Row {
 		SchemaVersion: 1, ID: v.RunID, Scope: "fsm-" + s.Workflow, Target: map[string]string{"type": "fsm", "id": s.Workflow + "@" + base},
 		Status: status, Verdict: verdict, ExecutionMode: "fsm", PreviousRunID: s.ParentRunID, AttemptNumber: attempt, MaxAttempts: machine.MaxAttempts,
 		BaseSHA: s.BaseSHA, HeadSHA: s.Head, CreatedAt: s.CreatedAt.UTC().Format(rfc3339Nano), UpdatedAt: now.UTC().Format(rfc3339Nano),
+		// root: store — FSMRunDir is relative to RepoRoot, the store root the run lives under.
 		RepoRoot: s.RepoRoot, Mock: s.Mock != "" || s.MockTainted, Outcome: string(s.Outcome), FSMRunDir: ".metareview/runs/" + v.RunID + "/",
 		WorkflowHash: s.WorkflowHash, WorkflowSource: source, EscalationReason: reason,
 	}
@@ -215,7 +217,7 @@ func appendRow(root string, row Row) error {
 	}
 	var steps []func() error
 	if t.fragment != nil {
-		torn := filepath.Join(root, ".metareview", "runs", ".torn")
+		torn := filepath.Join(root, ".metareview", "runs", ".torn") // root: store
 		steps = append(steps,
 			func() error { return os.MkdirAll(torn, 0o700) },
 			func() error {

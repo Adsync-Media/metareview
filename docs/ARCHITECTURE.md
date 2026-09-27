@@ -119,6 +119,12 @@ set — the `review-lenses` node's rubric is a per-workflow param defaulting to 
 own freshness (child logs/evidence/intent, which live outside the diff) is guarded by the deterministic
 pre-checks in `RunEpicReady`, which re-read current state on every gate run.
 
+**Where a run lives (two roots, §6).** A run's audit, sidecars and terminal `runs.jsonl` row live under the
+**store root** — the main worktree, whichever worktree ran `fsm init` — so every worktree sees one store and run
+ids stay unique. The run *reviews* its **work dir** (default: the checkout `init` ran in; `--work-dir` overrides),
+and a default `fsm export` bundle is written under the checkout that ran `export`
+(`export.DefaultOut`), so it is committed on that branch.
+
 Exit contract (`metareview fsm`): `3` = the FSM needs the host to do a node's work; `1`+`GATE_FAILED` = run
 `resume_hint` (forks a child = new run id); `1`+`ERR_*` = read `code`; `2` = nothing recorded (fix input and
 retry unless it's a consent/escalation code); `STOPPED`/`DONE` terminal. Escalation is per fork lineage.
@@ -154,6 +160,17 @@ Enforces review-before-push **in git**, not in a command-string parser (which is
   clean.
 - **Transient, local (git-ignored)** under `.metareview/`: `findings.jsonl`, `runs.jsonl`, `runs/`,
   `shards/`, `git-hooks/`. A `mock: true` FSM run never satisfies a gate.
+- **Two roots — store vs work (#169, #172; plan in #171).** Every `.metareview`/`docs` path names which root it
+  means. **Store root** = the main worktree (`git worktree list --porcelain`, shared parser
+  `repo.MainWorktreeFromPorcelain`): the FSM run store `.metareview/runs/<id>/`, the FSM's terminal row in
+  `runs.jsonl` (run ids are store-unique; `record.Exists` checks it), run listing, escalation lineage, and the
+  run a `record-lenses --from-run` reads (`repo.RunStoreRoot`). **Work root** = the checkout the command runs in
+  (`rev-parse --show-toplevel`): a run's default work dir, the diff base..head, and work output meant to be
+  committed on that branch — a default `fsm export` bundle lands in the *requesting* worktree's
+  `docs/metareview/fsm/`; the runs-not-ignored warning asks the store root, where the row is written. In a single
+  checkout the two coincide. Tripwires, not proofs (they match literal path forms only):
+  `TestFSMRootsAreDeclared` (a `root: store|work` declaration at each such site in `internal/fsm`) and
+  `TestRunStoreReadersAreDeclared` (run-store readers outside the FSM). Still per-directory and planned in #171: `status`' abandoned-run scan and findings.
 - **Run lineage:** a NEEDS_REVISION parent is retired when a clean same-target+same-kind child links via
   `previousRunId` (supersede). Repair via `--previous-run <run-id>`; never `git add -A` failed-run artifacts.
 - **Evidence receipts:** `evidence run -- <cmd>` records a validation receipt (kind + exitCode + hashes);
@@ -248,6 +265,9 @@ list below is illustrative, omitting e.g. `judge`, `gate`, `converge`, `export`)
 
 ## 10. Gotchas that have bitten us
 
+- "The repository root" is two roots once linked worktrees exist (§6). A path built from the wrong one works in
+  a single checkout and silently breaks in a worktree (#169: runs written to main, read from the linked tree).
+  Declare the root at the site; the tripwire tests fail otherwise.
 - A single-package test fixture hides multi-package `go test ./...` classification bugs — key on the target's
   own `-v` markers.
 - A mock judge ignores model/effort — a node that calls the judge needs `model` in the YAML or it's DOA in

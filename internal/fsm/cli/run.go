@@ -194,7 +194,7 @@ type opened struct {
 func (in *invocation) openRun(mode judgeMode, readOnly, repair bool) (*opened, envelope, int, bool) {
 	c := in.c
 	base := envelope{}
-	root, err := c.rootOf()
+	root, err := c.storeRoot()
 	if err != nil {
 		return nil, base, in.fail(base, err, phaseOpen, false), false
 	}
@@ -253,13 +253,13 @@ func (in *invocation) init() int {
 	if !p.has("workflow") {
 		return in.usage("--workflow is required")
 	}
-	root, err := c.rootOf()
+	root, err := c.storeRoot()
 	if err != nil {
 		return in.fail(base, err, phaseInit, false)
 	}
 	workDir := in.abs(p.flags["work-dir"])
 	if workDir == "" {
-		if workDir, err = c.toplevel(); err != nil {
+		if workDir, err = c.workRoot(); err != nil {
 			return in.fail(base, err, phaseInit, false)
 		}
 	}
@@ -330,8 +330,9 @@ func (in *invocation) init() int {
 	env := envelope{}
 	viewKeys(env, v)
 	in.warns = append(in.warns, in.warnEvents(md.Store, v.RunID)...)
-	if !c.runsIgnored(workDir) {
-		in.warns = append(in.warns, WarnRunsNotIgnored+": .metareview/runs.jsonl is not ignored in "+workDir)
+	// root: store — the terminal row is appended at the store root (record.path), so ask there, not the work dir.
+	if !c.runsIgnored(root) {
+		in.warns = append(in.warns, WarnRunsNotIgnored+": .metareview/runs.jsonl is not ignored in "+root)
 	}
 	names := []string{}
 	for _, a := range v.Snapshot.AllowedCmds {
@@ -891,7 +892,7 @@ func (in *invocation) diff() int {
 		return in.usage("diff needs --a <run> --b <run>")
 	}
 	c := in.c
-	root, err := c.rootOf()
+	root, err := c.storeRoot()
 	if err != nil {
 		return in.fail(envelope{}, err, phaseNone, false)
 	}
@@ -937,13 +938,24 @@ func (in *invocation) export() int {
 	}
 	env := base
 	viewKeys(env, o.m.View())
-	m, err := export.Export(in.c.ctx, in.c.exportDeps(o.root, o.md), o.id, opts)
+	work, err := in.c.workRoot()
+	if err != nil {
+		// Fall back to the store root only when there is genuinely no work tree around cwd (cwd inside .git).
+		// Any other failure inside a real worktree is returned: falling back there would silently write the
+		// bundle to the main checkout, which is the bug this root split fixes (#172).
+		if !in.c.outsideWorkTree() {
+			return in.fail(env, err, phaseNone, false)
+		}
+		work = o.root
+	}
+	deps := in.c.exportDeps(o.root, work, o.md)
+	m, err := export.Export(in.c.ctx, deps, o.id, opts)
 	if err != nil {
 		return in.fail(env, err, phaseNone, false)
 	}
 	out := opts.Out
 	if out == "" {
-		out = filepath.Join(o.root, "docs", "metareview", "fsm", o.id)
+		out = export.DefaultOut(deps, o.id)
 	}
 	env["manifest"], env["out"], env["untrusted"] = m, out, []string{}
 	return in.ok(env, StatusOK, 0)
@@ -952,7 +964,7 @@ func (in *invocation) export() int {
 // StatusLines renders the `metareview status` FSM section (spec 5 §6): read-only over Store.List() at the main root.
 func StatusLines(ctx context.Context, deps Deps, cwd string) []string {
 	c := &ctxDeps{ctx: ctx, deps: deps, cwd: cwd}
-	root, err := c.rootOf()
+	root, err := c.storeRoot()
 	if err != nil {
 		return nil
 	}

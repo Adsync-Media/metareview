@@ -99,9 +99,21 @@ func (c *ctxDeps) removeSandboxes() {
 	c.sandboxRoots = nil
 }
 
-// rootOf resolves the main worktree of cwd (spec 5 §2): the first `worktree` line of `git worktree list --porcelain`;
+// The FSM resolves two roots, and every path it builds must say which one it means (#169, #172):
+//
+//   - storeRoot — shared state: the run store (.metareview/runs/<id>/), the terminal runs.jsonl row (run ids are
+//     unique across the store; record.Exists checks that row), run listing, and escalation lineage. It is the main
+//     worktree, whichever worktree the command runs in.
+//   - workRoot — the checkout the command runs in: the default work dir a run reviews, and work output meant to be
+//     committed on that checkout's branch, such as a default export bundle.
+//
+// In a single checkout the two coincide. Every .metareview/docs path in internal/fsm carries a `root: store` or
+// `root: work` declaration. TestFSMRootsAreDeclared is a tripwire for that over the literal path forms (split
+// elements and slash-joined strings), not proof: a path assembled any other way is not seen.
+
+// storeRoot resolves the main worktree of cwd (spec 5 §2): the first `worktree` line of `git worktree list --porcelain`;
 // a bare main or a non-repository is ERR_NOT_A_REPO.
-func (c *ctxDeps) rootOf() (string, error) {
+func (c *ctxDeps) storeRoot() (string, error) {
 	out, code, err := c.git(c.cwd, "worktree", "list", "--porcelain")
 	if err != nil || code != 0 {
 		return "", errs.E(CodeNotARepo, "not inside a git repository", "cwd", c.cwd)
@@ -114,8 +126,8 @@ func (c *ctxDeps) rootOf() (string, error) {
 	return path, nil
 }
 
-// toplevel is the current worktree (init's WorkDir default).
-func (c *ctxDeps) toplevel() (string, error) {
+// workRoot is the current worktree (init's WorkDir default, and the default export destination's root).
+func (c *ctxDeps) workRoot() (string, error) {
 	out, code, err := c.git(c.cwd, "rev-parse", "--show-toplevel")
 	if err != nil || code != 0 || out == "" {
 		return "", errs.E(CodeNotARepo, "not inside a git worktree", "cwd", c.cwd)
@@ -123,15 +135,23 @@ func (c *ctxDeps) toplevel() (string, error) {
 	return out, nil
 }
 
-// runsIgnored reports whether .metareview/runs.jsonl is ignored in workDir (git check-ignore exits 0).
-func (c *ctxDeps) runsIgnored(workDir string) bool {
-	_, code, err := c.git(workDir, "check-ignore", "-q", ".metareview/runs.jsonl")
+// outsideWorkTree reports whether git positively says cwd is not inside a work tree (it prints "false", as it does
+// inside .git). A git failure is not "outside": callers must treat it as an error, not as a reason to fall back.
+func (c *ctxDeps) outsideWorkTree() bool {
+	out, code, err := c.git(c.cwd, "rev-parse", "--is-inside-work-tree")
+	return err == nil && code == 0 && out == "false"
+}
+
+// runsIgnored reports whether .metareview/runs.jsonl is ignored in dir (git check-ignore exits 0). Callers pass
+// the store root: that is where the FSM appends its terminal row.
+func (c *ctxDeps) runsIgnored(dir string) bool {
+	_, code, err := c.git(dir, "check-ignore", "-q", ".metareview/runs.jsonl") // root: store (dir is the store root)
 	return err == nil && code == 0
 }
 
 // peek reads the first line of a run's audit.jsonl leniently (spec 5 §8: advisory; Open re-verifies everything).
 func (c *ctxDeps) peek(root, runID string) (run.InitData, bool) {
-	raw, err := c.deps.ReadFile(filepath.Join(root, ".metareview", "runs", runID, "audit.jsonl"))
+	raw, err := c.deps.ReadFile(filepath.Join(root, ".metareview", "runs", runID, "audit.jsonl")) // root: store
 	if err != nil {
 		return run.InitData{}, false
 	}
@@ -171,6 +191,9 @@ func (c *ctxDeps) scenarioFor(root string, d run.InitData) (*mockai.Scenario, er
 		return nil, errs.E(CodeRepoRootMismatch, "the run was created in another checkout; mock runs are path-bound", "stored", d.RepoRoot, "root", root)
 	}
 	rel, _, _ := strings.Cut(d.Mock, "#")
+	// Store root, deliberately: a mock run is path-bound to the checkout that created it (the RepoRoot check
+	// above), and its scenario path was recorded relative to that root. Resolving scenarios in the work root
+	// instead would change what a recorded mock path means; see #172's follow-ups.
 	dir := filepath.Join(root, rel)
 	if _, inside := relInside(root, dir); !inside {
 		return nil, errs.E(machine.CodeMockInvalid, "mock scenario must live inside the repository", "dir", rel, "reason", "outside")
@@ -291,8 +314,10 @@ func (c *ctxDeps) machineDeps(root string, scenario *mockai.Scenario, mode judge
 	return md, nil
 }
 
-func (c *ctxDeps) exportDeps(root string, md machine.Deps) export.Deps {
-	return export.Deps{Store: md.Store, Sidecar: md.Sidecar, Kinds: md.Kinds, FS: c.deps.ExportFS, Clock: md.Clock, RepoRoot: root, Home: c.deps.Getenv(EnvHome)}
+// exportDeps binds export to both roots: store for reading the run and relativising its paths, work for where
+// a default bundle is written (the checkout that ran the command).
+func (c *ctxDeps) exportDeps(store, work string, md machine.Deps) export.Deps {
+	return export.Deps{Store: md.Store, Sidecar: md.Sidecar, Kinds: md.Kinds, FS: c.deps.ExportFS, Clock: md.Clock, RepoRoot: store, WorkRoot: work, Home: c.deps.Getenv(EnvHome)}
 }
 
 // resolveRun applies the --run precedence: flag → MRV_RUN_ID → newest run without an Error summary.
