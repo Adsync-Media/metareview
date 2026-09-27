@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // withSeams installs fake external-process seams for the test: lookGh returns lookErr, and runCommand
@@ -267,5 +268,141 @@ func TestExcerptExactlyAtBoundary(t *testing.T) {
 	s := strings.Repeat("x", maxExcerptRunes)
 	if got := excerpt(s); got != s {
 		t.Fatalf("excerpt at exactly maxExcerptRunes should be unchanged, got %d runes ending %q", len([]rune(got)), got[max(0, len(got)-4):])
+	}
+}
+
+// TestRedactLeavesWordsThatContainKeyPrefixes (#184): a key-prefix match that is lowercase-only text inside a
+// word is left alone. Every task-done review path contains "sk-done-…" (ta*sk-done*), which the sk- pattern used
+// to redact, so pr-ready logs listed unresolvable "ta[REDACTED]" evidence paths. Real keys, which carry uppercase
+// letters, are still redacted wherever they appear.
+func TestRedactLeavesWordsThatContainKeyPrefixes(t *testing.T) {
+	for _, keep := range []string{
+		"docs/metareview/reviews/mrv-20260831-183207933768000-task-done-mechanical-precision-lens-c79c1389.md",
+		"- docs-0.6.0-documentation: PASS (docs/metareview/reviews/mrv-20260705-161047045358000-task-done-docs-0-6-0-documentation-1a2b3c4d.md)",
+		"the risk-proj-abcdefghijklmnop-assessment",
+		"laughs_12345678 and neighs_abcdefgh",
+		"see mygithub_pat_abcdefghijklmnop for the naming scheme",
+		// "%2g" is not a percent-escape (g is not hex), so a lowercase-only match after it is word-interior.
+		"x%2gsk-abcdefghijklmnopqrstu",
+		// Word-interior matches near the start of the text (keyIsWordInterior's index bounds), after 'z' (the top
+		// of the lowercase range), and with uppercase text right after the match, outside it.
+		"xsk-abcdefghijklmnopqrstu",
+		"xyghp_abcdefghijkl",
+		"zsk-abcdefghijklmnopqrstu",
+		"docs/metareview/reviews/mrv-20260831-183207933768000-task-done-mechanical-precision-lens-c79c1389.md PASS",
+	} {
+		if got := Redact(keep); got != keep {
+			t.Errorf("Redact(%q) = %q, want it unchanged", keep, got)
+		}
+	}
+	for _, secret := range []string{
+		"sk-abcdefghijklmnopqrstuvwxyz0123",
+		"OPENAI=sk-abcdefghijklmnopqrstuvwxyz0123",
+		"key: sk-proj-abcdefghijklmnopqrstuvwx",
+		"ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+		"(ghs_abcdefghijklmnop)",
+		"github_pat_abcdefghijklmnopqrstuvwxyz",
+		// Lowercase-only keys in shapes that are not word-interior, all redacted before #184 and still redacted
+		// after it: percent-encoding, underscores and _emphasis_ (a non-lowercase byte precedes the key), and a
+		// literal \n or \t escape in pasted JSON/log text (the backslash-escape exception).
+		"?api_key%3Dsk-abcdefghijklmnopqrstuvwxyz",
+		"https%3A%2F%2Fghp_abcdefghijklmnopqrstuvwxyz%40github.com",
+		"%20ghp_abcdefghijklmnopqrstuvwxyz",
+		`"line\nghp_abcdefghijklmnopqrstuvwxyz"`,
+		`\tsk-abcdefghijklmnopqrstuvwxyz`,
+		"OPENAI_API_KEY_sk-abcdefghijklmnopqrstuvwxyz",
+		"_ghp_abcdefghijklmnopqrstuvwxyz_",
+		// Lowercase-hex percent-encoding and other backslash escapes end in a lowercase letter. The mixed-case keys
+		// here are redacted by the uppercase rule; the lowercase-only ones (token%3dsk-proj-…, %2fghp_…) are what
+		// exercise the %XX exception, including a percent-escape at the very start of the text.
+		"?next=%2fghp_ABCDEFGH12345678",
+		"token%3dsk-proj-abcdefghijklmnopqrstuv",
+		"x%3aghs_ABCDEFGH1234abcdefghijklmnop",
+		`\\bghp_abcdefghijklmnopqrstuvwxyz`,
+		`"\\rsk-abcdefghijklmnopqrstuvwxyz"`,
+		// Real keys are random base62 and carry an uppercase letter, so they are redacted whatever precedes them:
+		// ANSI colour codes, multi-character hex and unicode escapes, a plain lowercase letter.
+		"\x1b[32mghp_ABCDEFGHIJKLMNOP1234\x1b[0m",
+		`\x3dghp_ABCDEFGHIJKLMNOP1234`,
+		`\u003cghp_ABCDEFGHIJKLMNOP1234`,
+		`\u001b[1msk-proj-ABCDEFGHIJKLMNOPqrstuv`,
+		"askghp_ABCDEFGHIJKLMNOP1234",
+		// A lowercase-only key still redacts in a context that is not a word interior.
+		"KEYghp_abcdefghijklmnopqrstuvwxyz",
+		"0sk-abcdefghijklmnopqrstuvwxyz",
+		// A key whose only uppercase letter is its last byte, at both ends of the uppercase range.
+		"xghp_abcdefghijklmnopA",
+		"xghp_abcdefghijklmnopZ",
+		// A skipped word-interior match must not end the scan: a real key later in the same text is still redacted.
+		"see task-done-mechanical-precision-lens then sk-abcdefghijklmnopqrstuvwxyz0123",
+		"laughs_12345678 and ghs_ABCDEFGHIJKLMNOP1234",
+		"%2fghp_abcdefghijklmnopqrst",
+		"?q=%2fghp_abcdefghijklmnopqrst",
+	} {
+		if got := Redact(secret); !strings.Contains(got, redactionMarker) || strings.Contains(got, "abcdefghijklmnop") {
+			t.Errorf("Redact(%q) = %q, want the key redacted", secret, got)
+		}
+	}
+}
+
+// TestRedactKeepsTheCharacterBeforeAKey pins the exact output: only the key-prefix match is replaced, so the text
+// in front of it survives, and a bearer token is redacted whole, tail and all (#184).
+func TestRedactKeepsTheCharacterBeforeAKey(t *testing.T) {
+	for in, want := range map[string]string{
+		"key=sk-abcdefghijklmnopqrstuvwxyz":                          "key=" + redactionMarker,
+		"(ghs_abcdefghijklmnop)":                                     "(" + redactionMarker + ")",
+		`"line\\nghp_abcdefghijklmnopqrstuvwxyz"`:                    `"line\\n` + redactionMarker + `"`,
+		"?next=%2fghp_ABCDEFGH12345678&x=1":                          "?next=%2f" + redactionMarker + "&x=1",
+		"Authorization: Bearer sk-abcdefghijklmnopqrstuv.SECRETTAIL": "Authorization: Bearer " + redactionMarker,
+		"authorization: bearer ghp_abcdefghijklmnopqrstuvwxyz":       "Authorization: Bearer " + redactionMarker,
+	} {
+		if got := Redact(in); got != want {
+			t.Errorf("Redact(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A lowercase key after a multi-character escape is not word-interior: the letter before it ends the escape
+// (\x3d, =, an ANSI colour code), not a word. CodeRabbit on #190.
+func TestRedactLowercaseKeysAfterMultiCharacterEscapes(t *testing.T) {
+	key := "sk-abcdefghijklmnopqrstuvwxyz0123"
+	for _, prefix := range []string{`token\x3d`, `token\u003d`, "\x1b[32m", `\u001b[0m`, `\x1b[1;31m`, `\033[0m`, `\e[0m`, "\x1b[?25l", `\x1b[38:5:2m`, "\x1b[1 q"} {
+		if got := Redact(prefix + key); got != prefix+redactionMarker {
+			t.Errorf("Redact(%q) = %q, want the key redacted", prefix+key, got)
+		}
+	}
+	// Not an escape: a word that merely has hex-looking letters before the key keeps the word-interior rule.
+	// Nor does a bracket that no ESC introduces make a CSI sequence.
+	for _, word := range []string{"x3dsk-abcdefghijklmnopqrstuvwxyz0123", "arr[0msk-abcdefghijklmnopqrstuvwxyz0123"} {
+		if got := Redact(word); got != word {
+			t.Errorf("a plain lowercase word must stay word-interior, got %q", got)
+		}
+	}
+}
+
+// A skipped word-interior match must not hide a separately delimited key inside it: "task-done-sk-…" first
+// matches from the "sk-" in "task", and the real key after the hyphen must still be found. CodeRabbit on #190.
+func TestRedactFindsAKeyInsideASkippedMatch(t *testing.T) {
+	for in, want := range map[string]string{
+		"task-done-sk-abcdefghijklmnopqrstuvwxyz0123":                                                          "task-done-" + redactionMarker,
+		"docs/task-done-review-sk-abcdefghijklmnopqrstuvwxyz0123.md":                                           "docs/task-done-review-" + redactionMarker + ".md",
+		"docs/metareview/reviews/mrv-20260831-183207933768000-task-done-mechanical-precision-lens-c79c1389.md": "docs/metareview/reviews/mrv-20260831-183207933768000-task-done-mechanical-precision-lens-c79c1389.md",
+	} {
+		if got := Redact(in); got != want {
+			t.Errorf("Redact(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Redaction stays linear on a long run of word-interior matches: rescanning each skipped match from its next
+// byte made 100KB of "task-done-" take ~9s (Redact runs on untruncated PR comments and session history).
+func TestRedactIsLinearOnLongWordInteriorRuns(t *testing.T) {
+	in := strings.Repeat("task-done-", 100_000) // 1MB, one unbroken run
+	start := time.Now()
+	if got := Redact(in); got != in {
+		t.Fatal("a run of word-interior text must pass through unchanged")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("Redact took %v on 1MB of word-interior text; it must be linear", d)
 	}
 }

@@ -61,13 +61,139 @@ type author struct {
 
 var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)authorization:\s*bearer\s+[A-Za-z0-9._~+/=-]+`),
+	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+	regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`),
+	regexp.MustCompile(`(?i)\b(token|secret|password|api[_-]?key)\s*[:=]\s*("[^"]+"|'[^']+'|[^\s` + "`" + `,;]+)`),
+}
+
+// keyPrefixPatterns match provider keys by their prefix. Unfiltered, "sk-" matched the "sk-done-…" in every
+// "task-done-…" review path and "ghs_" matched "laughs_…", redacting ordinary text (#184). So each match is
+// kept only if it is word-interior text — see keyIsWordInterior; everything else is redacted.
+var keyPrefixPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9_]{8,}`),
 	regexp.MustCompile(`github_pat_[A-Za-z0-9_]+`),
 	regexp.MustCompile(`sk-proj-[A-Za-z0-9_-]{16,}`),
 	regexp.MustCompile(`sk-[A-Za-z0-9_-]{20,}`),
-	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
-	regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`),
-	regexp.MustCompile(`(?i)\b(token|secret|password|api[_-]?key)\s*[:=]\s*("[^"]+"|'[^']+'|[^\s` + "`" + `,;]+)`),
+}
+
+// keyIsWordInterior reports whether the key-prefix match text[start:end] is ordinary lowercase text rather than
+// a key: it has no uppercase letter AND it continues a lowercase word — the byte before it is a lowercase letter
+// that does not end a two-character backslash escape (\n, \t, \b …) or a %XX percent-escape. Real provider
+// keys are random base62 and carry uppercase letters, so they are redacted in any context — after ANSI colour
+// codes (ESC[32m), \u003c or \x3d escapes, or plain letters — without enumerating contexts; a lowercase-only
+// match is redacted unless it is word-interior.
+func keyIsWordInterior(text string, start, end int) bool {
+	if strings.IndexFunc(text[start:end], func(r rune) bool { return r >= 'A' && r <= 'Z' }) >= 0 {
+		return false
+	}
+	return continuesWord(text, start)
+}
+
+// continuesWord reports whether the byte before start is a lowercase letter that continues a word rather than
+// ending an escape (\n, %3d, \x3d, \u003d, ESC[0m).
+func continuesWord(text string, start int) bool {
+	if start == 0 || !isLowerASCII(text[start-1]) {
+		return false
+	}
+	if start >= 2 && text[start-2] == '\\' { // a \n, \t, \b … escape
+		return false
+	}
+	if start >= 3 && text[start-3] == '%' && isHexASCII(text[start-2]) && isHexASCII(text[start-1]) { // a %2f, %3d … escape
+		return false
+	}
+	return !endsMultiCharEscape(text[:start])
+}
+
+// endsMultiCharEscape reports whether before ends in an escape whose last character is a lowercase letter: a
+// \xHH or \uHHHH escape (\x3d, \u003d) or an ANSI CSI sequence (ESC[0m, ESC[1;31m, ESC[?25l), with ESC written raw
+// or as \x1b, \u001b, \033 or \e. The letter before the key then ends the escape, not a word.
+func endsMultiCharEscape(before string) bool {
+	n := len(before)
+	if n >= 4 && before[n-4] == '\\' && before[n-3] == 'x' && isHexASCII(before[n-2]) && isHexASCII(before[n-1]) {
+		return true
+	}
+	if n >= 6 && before[n-6] == '\\' && before[n-5] == 'u' && isHexASCII(before[n-4]) && isHexASCII(before[n-3]) &&
+		isHexASCII(before[n-2]) && isHexASCII(before[n-1]) {
+		return true
+	}
+	// CSI: ESC '[' then parameter bytes (0x30-0x3f: digits, ; : < = > ?) and intermediate bytes (0x20-0x2f),
+	// ending in the final letter just before the key.
+	i := n - 2
+	for i >= 0 && before[i] >= 0x20 && before[i] <= 0x3f {
+		i--
+	}
+	if i < 0 || before[i] != '[' {
+		return false
+	}
+	esc := before[:i]
+	if strings.HasSuffix(esc, "\x1b") {
+		return true
+	}
+	for _, e := range []string{`\x1b`, `\x1B`, `\u001b`, `\u001B`, `\033`, `\e`} {
+		if strings.HasSuffix(esc, e) {
+			return true
+		}
+	}
+	return false
+}
+
+func isLowerASCII(c byte) bool { return c >= 'a' && c <= 'z' }
+
+func isHexASCII(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+// anchoredKeyPrefixPatterns are keyPrefixPatterns anchored at the start, to test one candidate position.
+var anchoredKeyPrefixPatterns = func() []*regexp.Regexp {
+	out := make([]*regexp.Regexp, len(keyPrefixPatterns))
+	for i, p := range keyPrefixPatterns {
+		out[i] = regexp.MustCompile(`^(?:` + p.String() + `)`)
+	}
+	return out
+}()
+
+// redactKeyPrefixes replaces every key-prefix match that is not word-interior with the marker, leaving the text
+// around it untouched. A skipped word-interior match may still hide a separately delimited key inside it
+// ("task-done-sk-…" first matches from the "sk-" in "task"), so its span is searched once for a later prefix that
+// does not continue a word. Any such inner match shares the outer one's character class, so it is uppercase-free
+// and ends where the outer one does: only the byte before it decides. Each skipped span is walked once, keeping
+// redaction linear — resuming the regex one byte into it was quadratic on long runs of lowercase text.
+func redactKeyPrefixes(text string) string {
+	for i, pattern := range keyPrefixPatterns {
+		literal, _ := pattern.LiteralPrefix()
+		var b strings.Builder
+		last := 0
+		for pos := 0; pos < len(text); {
+			loc := pattern.FindStringIndex(text[pos:])
+			if loc == nil {
+				break
+			}
+			start, end := pos+loc[0], pos+loc[1]
+			if keyIsWordInterior(text, start, end) {
+				inner, innerEnd := -1, 0
+				for p := start + 1; p < end; p++ {
+					if continuesWord(text, p) || !strings.HasPrefix(text[p:end], literal) {
+						continue
+					}
+					if m := anchoredKeyPrefixPatterns[i].FindStringIndex(text[p:end]); m != nil {
+						inner, innerEnd = p, p+m[1]
+						break
+					}
+				}
+				if inner < 0 {
+					pos = end
+					continue
+				}
+				start, end = inner, innerEnd
+			}
+			b.WriteString(text[last:start])
+			b.WriteString(redactionMarker)
+			last, pos = end, end
+		}
+		b.WriteString(text[last:])
+		text = b.String()
+	}
+	return text
 }
 
 // runCommand and lookGh are the external-process seams. Production shells out (realCommand, exec.LookPath);
@@ -153,10 +279,12 @@ func realCommand(root, name string, args ...string) (string, error) {
 
 func Redact(text string) string {
 	redacted := text
+	// The whole-value patterns run first: an Authorization: Bearer value or a token=… value is redacted entire,
+	// tail and all, before the key-prefix pass could replace only the key and leave the rest behind (#184).
 	for _, pattern := range secretPatterns {
 		redacted = pattern.ReplaceAllStringFunc(redacted, redactMatch)
 	}
-	return redacted
+	return redactKeyPrefixes(redacted)
 }
 
 // credKeyName matches exactly the key names of the token/secret/password/api_key pattern, so only a
