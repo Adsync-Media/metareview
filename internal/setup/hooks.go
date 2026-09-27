@@ -2,6 +2,7 @@ package setup
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -139,6 +140,42 @@ type HookInstallPlan struct {
 	Conflicts []string
 }
 
+// StopGateKey is the repository-local git config key that opts a repository into the Stop-hook gate (#194). The
+// plugin registers hooks/pre-finish.sh in every session on the machine; the hook gates only where this is "true",
+// and `setup --install-hooks` is what sets it.
+const StopGateKey = "metareview.stopGate"
+
+// EnableStopGate records the Stop-gate opt-in and nothing else, so a repository whose own hook manager owns
+// core.hooksPath (husky, lefthook, beads) — where `setup --install-hooks` refuses rather than override it — can
+// still opt in.
+func EnableStopGate(root string, git GitRunner) error {
+	if git == nil {
+		git = realGitRunner
+	}
+	if _, err := git(root, "rev-parse", "--git-dir"); err != nil {
+		return fmt.Errorf("cannot opt in: %s is not a usable git repository: %w", root, err)
+	}
+	if _, err := git(root, "config", "--local", StopGateKey, "true"); err != nil {
+		return fmt.Errorf("recording the Stop-gate opt-in: %w", err)
+	}
+	return nil
+}
+
+// DisableStopGate removes the Stop-gate opt-in, reporting whether one was recorded.
+func DisableStopGate(root string, git GitRunner) (bool, error) {
+	if git == nil {
+		git = realGitRunner
+	}
+	if _, err := git(root, "rev-parse", "--git-dir"); err != nil {
+		return false, fmt.Errorf("cannot opt out: %s is not a usable git repository: %w", root, err)
+	}
+	if !stopGateOptedIn(root, git) {
+		return false, nil
+	}
+	_, err := git(root, "config", "--local", "--unset-all", StopGateKey)
+	return err == nil, err
+}
+
 // PlanHookInstall inspects the repo READ-ONLY and returns what installing the gate would do. Two conflicts
 // are detected before anything is touched: (1) core.hooksPath is already set to a DIFFERENT path — we will
 // not override a user's choice; (2) core.hooksPath is unset but there are active (non-sample) hooks in
@@ -176,7 +213,10 @@ func PlanHookInstall(root string, git GitRunner) (HookInstallPlan, error) {
 	// so a reinstall could not restore Gap B for an already-installed repo. All three must hold, or we fall
 	// through and ApplyHookInstall re-materializes the scripts and (re)writes the gitignore block.
 	plan.HooksCurrent = local != "" && sameHookPath(root, local, target) && hooksCurrent(target)
-	if plan.HooksCurrent && gitpolicy.Present(root) {
+	// An install from before the Stop-gate opt-in (#194) has current hooks but no opt-in: not done, so a
+	// re-install records it and the Stop gate keeps working after the upgrade.
+	optIn, _ := git(root, "config", "--local", "--get", StopGateKey)
+	if plan.HooksCurrent && gitpolicy.Present(root) && strings.TrimSpace(string(optIn)) == "true" {
 		plan.AlreadyDone = true
 		return plan, nil
 	}
@@ -252,6 +292,9 @@ func ApplyHookInstall(root string, plan HookInstallPlan, force bool, git GitRunn
 	_ = gitpolicy.Ensure(root)
 	if _, err := git(root, "config", "--local", "core.hooksPath", plan.Target); err != nil {
 		return fmt.Errorf("setting core.hooksPath: %w", err)
+	}
+	if _, err := git(root, "config", "--local", StopGateKey, "true"); err != nil {
+		return fmt.Errorf("recording the Stop-gate opt-in: %w", err)
 	}
 	// Verify the gate is genuinely in place before the caller says so.
 	if !hooksMaterialized(plan.Target) {
@@ -337,6 +380,13 @@ func UninstallHookInstall(root string, git GitRunner) (bool, error) {
 	if !isOurHookPath(root, current, target) {
 		return false, fmt.Errorf("core.hooksPath is %s, not metareview's — leaving it unchanged", current)
 	}
+	// The opt-in goes FIRST, with the gate. Unset exits 5 when the key is already absent (an install from before
+	// #194), which is not a failure; anything else stops here with nothing taken apart, so the same command can
+	// finish the job once the failure clears. (Removing core.hooksPath first left a retry that found nothing to
+	// uninstall while metareview.stopGate kept pre-finish.sh gating the repository.)
+	if _, err := git(root, "config", "--local", "--unset-all", StopGateKey); err != nil && !isExitCode(err, 5) {
+		return false, fmt.Errorf("removing the Stop-gate opt-in (%s): %w", StopGateKey, err)
+	}
 	if _, err := git(root, "config", "--local", "--unset", "core.hooksPath"); err != nil {
 		return false, err
 	}
@@ -346,6 +396,12 @@ func UninstallHookInstall(root string, git GitRunner) (bool, error) {
 		_ = os.RemoveAll(mine)
 	}
 	return true, nil
+}
+
+// isExitCode reports whether err is a git process that exited with code.
+func isExitCode(err error, code int) bool {
+	var exit *exec.ExitError
+	return errors.As(err, &exit) && exit.ExitCode() == code
 }
 
 // activeGitHooks lists the non-sample hook files in the repo's COMMON .git/hooks — the hooks a core.hooksPath

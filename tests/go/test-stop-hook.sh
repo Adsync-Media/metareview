@@ -37,6 +37,28 @@ assert d["reason"], d
   printf '%s' "$1" | grep -q "$2" || { printf "FAIL: reason missing %s: %s\n" "" "" >&2; exit 1; }
 }
 
+# 0. Opt-in (#194). The plugin registers this hook in EVERY session, so it must be inert — exit 0, no
+#    output — wherever the repository has not opted in with `metareview setup --install-hooks`: an
+#    unrelated project, a directory that is not a repository, the FSM judge's scratch session. Even
+#    with metareview absent it must say nothing: "not installed" there is a block nobody asked for.
+out="$(METAREVIEW_BIN=definitely-not-installed bash "$HOOK")"
+if [ -n "$out" ]; then echo "FAIL: a repository that has not opted in must be left alone, got: $out"; exit 1; fi
+out="$(METAREVIEW_BIN="$TMP/mrv" bash "$HOOK")"
+if [ -n "$out" ]; then echo "FAIL: a repository that has not opted in must not be gated, got: $out"; exit 1; fi
+nonrepo="$TMP/not-a-repo"; mkdir -p "$nonrepo"
+out="$(printf '{"cwd":"%s"}' "$nonrepo" | METAREVIEW_BIN=definitely-not-installed bash "$HOOK")"
+if [ -n "$out" ]; then echo "FAIL: a directory outside any repository must be left alone, got: $out"; exit 1; fi
+# A repository with metareview's git gate installed but no opt-in (an install from before #194, or an unset
+# from inside the session) still is not gated — but says so, on stderr, never silently.
+git config --local core.hooksPath "$repo/.metareview/git-hooks"
+err="$(METAREVIEW_BIN="$TMP/mrv" bash "$HOOK" 2>&1 >/dev/null)"
+out="$(METAREVIEW_BIN="$TMP/mrv" bash "$HOOK" 2>/dev/null)"
+if [ -n "$out" ]; then echo "FAIL: a lost opt-in must not block, got: $out"; exit 1; fi
+printf '%s' "$err" | grep -q "enable-stop-gate" || { echo "FAIL: a lost opt-in must be announced on stderr, got: $err"; exit 1; }
+git config --local --unset core.hooksPath
+# From here on the repository has opted in — through the CLI, so the hook and the installer must agree on the key.
+"$TMP/mrv" setup --enable-stop-gate >/dev/null
+
 # 1. Absent tooling blocks. A check that did not run must never read as a check that found
 #    nothing wrong.
 out="$(METAREVIEW_BIN=definitely-not-installed bash "$HOOK")"

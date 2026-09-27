@@ -254,7 +254,12 @@ To enforce the review gate with git-native hooks (block an unreviewed `git push`
 metareview setup --install-hooks        # interactive; --yes headless, --dry-run preview, --uninstall-hooks to reverse
 ```
 
-It sets `core.hooksPath` for this clone (non-destructive — it refuses rather than override an existing one).
+It sets `core.hooksPath` for this clone (non-destructive — it refuses rather than override an existing one) and
+opts this repository into the plugin's Stop-hook gate (`metareview.stopGate=true`). The plugin's Stop hook does
+nothing in a repository that has not opted in, so installing or upgrading the plugin never gates your other
+projects. Upgrading from 0.13.x: re-run `setup --install-hooks` (or `setup --enable-stop-gate`) in each repository
+that should keep the Stop gate; `setup --enable-stop-gate` alone also opts in a repository whose own hook manager
+owns `core.hooksPath`.
 See the "Enforce the review gate" section of [INSTALL.md](INSTALL.md).
 
 ## Works even better with metaswarm!

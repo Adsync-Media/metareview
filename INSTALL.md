@@ -111,7 +111,17 @@ metareview setup --install-hooks --force    # override a detected conflict
 metareview setup --uninstall-hooks          # reverse it (only if it is metareview's)
 ```
 
-`--uninstall-hooks` unsets `core.hooksPath` and removes the materialized `.metareview/git-hooks/` scripts, but
+Install also **opts this repository into the Stop-hook gate** by recording `metareview.stopGate=true` in its
+local git config. The plugin registers its Stop hook (`hooks/pre-finish.sh`) in every host session, but the hook
+does nothing — no output, no block — in a repository that has not opted in, so the plugin never gates your other
+projects (#194). Upgrading from 0.13.x, re-run `setup --install-hooks` (or just `setup --enable-stop-gate`) in
+each repository that should keep the Stop gate; the SessionStart notice and `setup --check` (`optedIn`) point
+out a repository whose push gate is installed without the opt-in, and the Stop hook itself says so on stderr.
+A repository whose own hook manager owns `core.hooksPath` (husky, lefthook, beads) — where `--install-hooks`
+refuses rather than override it — opts into the Stop gate alone with `metareview setup --enable-stop-gate`
+(`--disable-stop-gate` reverses it).
+
+`--uninstall-hooks` unsets `core.hooksPath` and the Stop-gate opt-in, and removes the materialized `.metareview/git-hooks/` scripts, but
 **leaves the `.gitignore` block in place** — editing a user's `.gitignore` on uninstall is riskier than
 leaving inert ignore lines. To remove it, delete the block marked `# metareview: keep ephemeral review state
 local …` from `.gitignore` by hand. Re-running install (or `learn --post-merge`) re-adds it.

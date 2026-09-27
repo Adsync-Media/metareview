@@ -225,3 +225,35 @@ func TestLastReviewedNoForkPointMessageNamesTheCause(t *testing.T) {
 		t.Fatalf("code=%d stderr=%q, want the no-commits-of-its-own cause", code, errOut)
 	}
 }
+
+// #194: the standalone Stop-gate opt-in, for a repository whose hook manager owns core.hooksPath.
+func TestSetupStopGateToggles(t *testing.T) {
+	root := gitRepo(t)
+	code, out, errOut := runCLI(t, root, nil, "setup", "--enable-stop-gate")
+	if code != 0 || !strings.Contains(out, "opted in") {
+		t.Fatalf("enable: %d %q %q", code, out, errOut)
+	}
+	if got := gitIn(t, root, "config", "--local", "--get", "metareview.stopGate"); got != "true" {
+		t.Fatalf("metareview.stopGate = %q", got)
+	}
+	if code, out, errOut := runCLI(t, root, nil, "setup", "--disable-stop-gate"); code != 0 || !strings.Contains(out, "no longer") {
+		t.Fatalf("disable: %d %q %q", code, out, errOut)
+	}
+	if code, out, _ := runCLI(t, root, nil, "setup", "--disable-stop-gate"); code != 0 || !strings.Contains(out, "had not opted in") {
+		t.Fatalf("disable twice: %d %q", code, out)
+	}
+	if code, _, _ := runCLI(t, t.TempDir(), nil, "setup", "--enable-stop-gate"); code == 0 {
+		t.Fatal("enable outside a repository must fail")
+	}
+}
+
+// With another tool's core.hooksPath, --install-hooks refuses; its output must name the standalone Stop-gate opt-in
+// rather than only --force, which would override that tool (#194).
+func TestInstallHooksConflictNamesTheStopGateOptIn(t *testing.T) {
+	root := gitRepo(t)
+	gitIn(t, root, "config", "--local", "core.hooksPath", ".husky")
+	_, out, errOut := runCLI(t, root, nil, "setup", "--install-hooks", "--yes")
+	if !strings.Contains(out+errOut, "--enable-stop-gate") {
+		t.Fatalf("the conflict must name --enable-stop-gate:\n%s%s", out, errOut)
+	}
+}
