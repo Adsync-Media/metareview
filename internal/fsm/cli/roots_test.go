@@ -43,20 +43,30 @@ func TestLinkedWorktreeStoreAndWorkRoots(t *testing.T) {
 		t.Fatalf("done: %v", env)
 	}
 
-	// Store root: the run directory and its terminal row, exactly once, under the main worktree.
-	if _, err := os.Stat(filepath.Join(h.root, ".metareview", "runs", id, "audit.jsonl")); err != nil {
-		t.Fatalf("run not in the store root: %v", err)
+	// AC-2.2 (#173): the run directory and its terminal row, exactly once, in git's common directory — neither
+	// checkout's .metareview/ holds either.
+	common := filepath.Join(h.root, ".git", "metareview")
+	if _, err := os.Stat(filepath.Join(common, "runs", id, "audit.jsonl")); err != nil {
+		t.Fatalf("run not in the common-dir store: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(wt, ".metareview", "runs", id)); err == nil {
-		t.Fatal("run duplicated into the linked worktree")
-	}
-	rows, _ := os.ReadFile(filepath.Join(h.root, ".metareview", "runs.jsonl"))
+	rows, _ := os.ReadFile(filepath.Join(common, "runs.jsonl"))
 	if !strings.Contains(string(rows), `"id":"`+id+`"`) {
-		t.Fatalf("terminal row not in the store root's runs.jsonl: %s", rows)
+		t.Fatalf("terminal row not in the common-dir ledger: %s", rows)
 	}
-	if _, err := os.Stat(filepath.Join(wt, ".metareview", "runs.jsonl")); err == nil {
-		t.Fatal("terminal row written into the linked worktree")
+	for _, checkout := range []string{h.root, wt} {
+		if _, err := os.Stat(filepath.Join(checkout, ".metareview", "runs", id)); err == nil {
+			t.Fatalf("run duplicated into %s", checkout)
+		}
+		if _, err := os.Stat(filepath.Join(checkout, ".metareview", "runs.jsonl")); err == nil {
+			t.Fatalf("terminal row written into %s", checkout)
+		}
 	}
+	// The same run is visible from the main checkout.
+	h.cwd = h.root
+	if env := h.must(StatusOK, 0, "state", "--run", id); env["outcome"] != "clean" {
+		t.Fatalf("state from the main checkout: %v", env)
+	}
+	h.cwd = wt
 
 	// Work root: a default export lands in the worktree that ran the command, never in the main checkout.
 	env := h.must(StatusOK, 0, "export", "--run", id)
@@ -90,10 +100,19 @@ func TestLinkedWorktreeStoreAndWorkRoots(t *testing.T) {
 	}
 }
 
+// buildsCommonDirPath reports whether a line names a path in the shared store under git's common directory (#173):
+// the split form `"metareview", "<name>"` without the checkout's leading dot or a docs/ parent.
+func buildsCommonDirPath(code string) bool {
+	return strings.Contains(code, `"metareview", "`) && !strings.Contains(code, `"docs", "metareview"`) && !strings.Contains(code, `".metareview"`)
+}
+
 // buildsRootedPath reports whether a line of code names a .metareview or docs/metareview path, in either the
 // split form (filepath.Join(root, ".metareview", …), "docs", "metareview") or a slash-joined string literal
 // (".metareview/runs.jsonl", "docs/metareview/…").
 func buildsRootedPath(code string) bool {
+	if buildsCommonDirPath(code) {
+		return true
+	}
 	for _, lit := range []string{`".metareview"`, `"docs", "metareview"`, `".metareview/`, `"docs/metareview`} {
 		if strings.Contains(code, lit) {
 			return true
@@ -103,9 +122,10 @@ func buildsRootedPath(code string) bool {
 }
 
 // TestFSMRootsAreDeclared keeps #169/#172 from recurring inside the FSM: every line in internal/fsm that
-// names a .metareview or docs/metareview path must say which root it means — `root: store` (shared state,
-// the main worktree) or `root: work` (the checkout the command runs in) — on that line or within the three
-// lines above. It is a tripwire over those literal path forms (split elements and slash-joined strings), not
+// names a .metareview, docs/metareview or git-common-dir metareview path must say which root it means — `root: store`
+// (shared state) or `root: work` (the checkout the command runs in) — on that line or within the three lines above.
+// Since #173 `root: store` has two homes, so a common-dir site (buildsCommonDirPath) must also name "common dir"
+// (e.g. `root: store (git's common directory)`); a site that is not a store path at all may say `root: none`. It is a tripwire over those literal path forms (split elements and slash-joined strings), not
 // proof: a path assembled any other way is not seen. Comment lines are skipped.
 func TestFSMRootsAreDeclared(t *testing.T) {
 	const window = 3
@@ -131,12 +151,25 @@ func TestFSMRootsAreDeclared(t *testing.T) {
 			sites++
 			declared := false
 			for j := max(0, i-window); j <= i; j++ {
-				if strings.Contains(lines[j], "root: store") || strings.Contains(lines[j], "root: work") {
+				if strings.Contains(lines[j], "root: store") || strings.Contains(lines[j], "root: work") || strings.Contains(lines[j], "root: none") {
 					declared = true
 				}
 			}
 			if !declared {
-				t.Errorf("%s:%d builds a .metareview/docs path without a `root: store` or `root: work` declaration", path, i+1)
+				t.Errorf("%s:%d builds a .metareview/docs/common-dir path without a `root: store`, `root: work` or `root: none` declaration", path, i+1)
+			}
+			// `root: store` alone is ambiguous since #173 (the anchor checkout or git's common directory): a
+			// common-dir site must say which.
+			if buildsCommonDirPath(code) {
+				store, common, none := false, false, false
+				for j := max(0, i-window); j <= i; j++ {
+					store = store || strings.Contains(lines[j], "root: store")
+					common = common || strings.Contains(lines[j], "common dir")
+					none = none || strings.Contains(lines[j], "root: none")
+				}
+				if !none && (!store || !common) {
+					t.Errorf("%s:%d builds a common-dir store path without a `root: store (git's common directory)` declaration", path, i+1)
+				}
 			}
 		}
 		return nil
@@ -162,28 +195,20 @@ func TestExportWithoutACheckoutFallsBackToTheStoreRoot(t *testing.T) {
 	}
 }
 
-// TestRunsIgnoredChecksTheStoreRoot: the terminal runs.jsonl row is written under the store root, so the
-// not-ignored warning must ask the store root, not the worktree the run was started from. Here the main
-// checkout ignores runs.jsonl in a commit the linked worktree does not have.
-func TestRunsIgnoredChecksTheStoreRoot(t *testing.T) {
+// TestTerminalRowNeverDirtiesACheckout (#173): the terminal ledger lives in git's common directory, so no checkout —
+// main or linked, ignoring runs.jsonl or not — gains an untracked file or a not-ignored warning from a run.
+func TestTerminalRowNeverDirtiesACheckout(t *testing.T) {
 	h := newHarness(t)
-	wt := h.linkedWorktree() // at a commit whose .gitignore does not cover runs.jsonl
-	h.file("../.gitignore", "mock/\nfixtures/\nexp/\nsmall/\ndocs/\n.metareview/runs.jsonl\n")
-	git(t, h.root, "add", ".gitignore")
-	git(t, h.root, "commit", "-q", "-m", "ignore runs.jsonl in the main checkout only")
-	h.cwd = wt
-	env := h.must(StatusOK, 0, h.mockInit()...)
-	if w := env["warnings"].([]any); len(w) != 0 {
-		t.Fatalf("runs.jsonl is ignored where it is written (the store root); no warning expected, got %v", w)
-	}
-	// And the other direction: a store root that does not ignore it warns, naming the store root.
-	h.file("../.gitignore", "mock/\nfixtures/\nexp/\nsmall/\ndocs/\n")
-	git(t, h.root, "add", ".gitignore")
-	git(t, h.root, "commit", "-q", "-m", "stop ignoring runs.jsonl")
-	env = h.must(StatusOK, 0, h.mockInit()...)
-	w := env["warnings"].([]any)
-	if len(w) != 1 || w[0].(map[string]any)["code"] != WarnRunsNotIgnored || !strings.Contains(w[0].(map[string]any)["detail"].(string), h.root) {
-		t.Fatalf("want one runs-not-ignored warning naming the store root %s, got %v", h.root, w)
+	wt := h.linkedWorktree()
+	for _, cwd := range []string{h.root, wt} {
+		h.cwd = cwd
+		env := h.must(StatusOK, 0, h.mockInit()...)
+		if w := env["warnings"].([]any); len(w) != 0 {
+			t.Fatalf("init from %s: want no warnings, got %v", cwd, w)
+		}
+		if _, err := os.Stat(filepath.Join(cwd, ".metareview", "runs.jsonl")); err == nil {
+			t.Fatalf("init from %s wrote a checkout ledger", cwd)
+		}
 	}
 }
 

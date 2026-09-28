@@ -133,9 +133,9 @@ func TestSessionUsage(t *testing.T) {
 	}
 }
 
-// Issue #169: `fsm init` from a linked worktree stores the run under the MAIN worktree's
-// .metareview/runs/, so record-lenses run from that same linked worktree must read the run from
-// there too — not report "no such FSM run" for a run the FSM just created.
+// Issue #169, #173: `fsm init` from a linked worktree stores the run in the shared store (git's common
+// directory), so record-lenses run from that same linked worktree must read the run from there too —
+// not report "no such FSM run" for a run the FSM just created.
 func TestRecordLensesFindsFSMRunCreatedFromLinkedWorktree(t *testing.T) {
 	root := gitRepo(t)
 	wt := sessionWorktree(t, root)
@@ -165,7 +165,7 @@ func TestRecordLensesFindsFSMRunCreatedFromLinkedWorktree(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "Recorded task-done") {
 		t.Fatalf("passing run from linked worktree: code=%d out=%q err=%q", code, out, errOut)
 	}
-	if _, err := os.Stat(filepath.Join(wt, ".metareview", "runs", "passing-from-wt")); err == nil {
+	if _, err := os.Stat(filepath.Join(wt, ".metareview", "runs", "passing-from-wt")); err == nil { // run-store: current-worktree (asserting absence)
 		t.Fatal("the run must be read from the shared store, not copied into the linked worktree")
 	}
 
@@ -173,5 +173,36 @@ func TestRecordLensesFindsFSMRunCreatedFromLinkedWorktree(t *testing.T) {
 	writeFSMRun(t, root, "other-head", base, base, "")
 	if code, _, errOut := runCLI(t, wt, nil, "review", "record-lenses", "--scope", "task-done", "--base", base, "--mode", "subagent-adjudicated", "--from-run", "other-head", "--lenses", "feasibility"); code != 2 || !strings.Contains(errOut, "different diff") {
 		t.Fatalf("mismatched head from linked worktree: code=%d err=%q", code, errOut)
+	}
+}
+
+// #173: record-lenses --from-run reads the common-dir store; a run still in the 0.13.x location (not yet migrated
+// by an fsm command) is found there for one release, with a warning.
+func TestFromRunRunsDirPrefersTheCommonStore(t *testing.T) {
+	root, err := filepath.EvalSymlinks(gitRepo(t)) // git reports resolved paths (/private/var on macOS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	common := filepath.Join(root, ".git", "metareview", "runs")
+	legacy := filepath.Join(root, ".metareview", "runs")
+	for _, d := range []string{filepath.Join(common, "mrv-new"), filepath.Join(legacy, "mrv-old")} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "audit.jsonl"), []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if dir, warn := fromRunRunsDir(root, "mrv-new"); dir != common || warn != "" {
+		t.Fatalf("a common-dir run: %q %q", dir, warn)
+	}
+	if dir, warn := fromRunRunsDir(root, "mrv-old"); dir != legacy || !strings.Contains(warn, "0.13") {
+		t.Fatalf("a legacy run: %q %q", dir, warn)
+	}
+	if dir, warn := fromRunRunsDir(root, "mrv-none"); dir != common || warn != "" {
+		t.Fatalf("an unknown run is looked up in the common store: %q %q", dir, warn)
+	}
+	if dir, _ := fromRunRunsDir(t.TempDir(), "mrv-new"); dir == "" {
+		t.Fatal("outside a repository the lookup still names a directory, so the caller reports no such run")
 	}
 }

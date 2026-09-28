@@ -38,10 +38,10 @@ build_epic_repo() {
 
 # mkfsmrun <run-id> <base-sha> : forge an FSM audit whose init matches base..HEAD and reaches a passing outcome.
 mkfsmrun() {
-  mkdir -p ".metareview/runs/$1"
+  mkdir -p ".git/metareview/runs/$1"
   { printf '{"type":"init","data":{"base_sha":"%s","head":"%s","workflow":"epic-review-loop"}}\n' "$2" "$(git rev-parse HEAD)";
     printf '{"type":"transition","data":{"from":"adjudicate","to":"done","gate":"confirmed_nonempty","outcome":"reviewed","head":"%s"}}\n' "$(git rev-parse HEAD)";
-  } > ".metareview/runs/$1/audit.jsonl"
+  } > ".git/metareview/runs/$1/audit.jsonl"
 }
 
 # The gate exits 1 when it blocks; `|| true` keeps that from aborting the pipeline under `set -o pipefail`.
@@ -150,16 +150,16 @@ repo="$(mktemp -d)"
   # shellcheck disable=SC2086
   reject reject-no-fromrun  $ebase --mode subagent-adjudicated
   # A run that reviewed a DIFFERENT diff must not credit an epic-ready subagent marker.
-  mkdir -p .metareview/runs/other
-  printf '{"type":"init","data":{"base_sha":"deadbeef","head":"cafef00d","workflow":"epic-review-loop"}}\n' > .metareview/runs/other/audit.jsonl
+  mkdir -p .git/metareview/runs/other
+  printf '{"type":"init","data":{"base_sha":"deadbeef","head":"cafef00d","workflow":"epic-review-loop"}}\n' > .git/metareview/runs/other/audit.jsonl
   # shellcheck disable=SC2086
   reject reject-wrong-diff  $ebase --mode subagent-adjudicated --from-run other
   # A run over the RIGHT diff but produced by the generic review-loop (task-done rubric) must NOT credit the
   # epic-ready gate — else a non-epic review is laundered as epic evidence (bypassing the lens seam).
-  mkdir -p .metareview/runs/wrongwf
+  mkdir -p .git/metareview/runs/wrongwf
   { printf '{"type":"init","data":{"base_sha":"%s","head":"%s","workflow":"review-loop"}}\n' "$(git rev-parse main)" "$(git rev-parse HEAD)";
     printf '{"type":"transition","data":{"from":"adjudicate","to":"done","gate":"confirmed_nonempty","outcome":"reviewed","head":"%s"}}\n' "$(git rev-parse HEAD)";
-  } > .metareview/runs/wrongwf/audit.jsonl
+  } > .git/metareview/runs/wrongwf/audit.jsonl
   # shellcheck disable=SC2086
   reject reject-wrong-workflow $ebase --mode subagent-adjudicated --from-run wrongwf
   echo "ok: cli-epic-ready-scope-and-rejects"
@@ -180,7 +180,7 @@ repo="$(mktemp -d)"
   init="$(OPENAI_API_KEY=unused "$BIN" fsm init --workflow epic-review-loop --base main --var JUDGE=gpt-5.2 --var JUDGE_EFFORT=medium 2>/dev/null || true)"
   run="$(printf '%s' "$init" | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p')"
   [ -n "$run" ] || { echo "FAIL: [base-advanced] fsm init produced no run: $init"; exit 1; }
-  grep -q "\"base_sha\":\"$fork\"" ".metareview/runs/$run/audit.jsonl" ||
+  grep -q "\"base_sha\":\"$fork\"" ".git/metareview/runs/$run/audit.jsonl" ||
     { echo "FAIL: [base-advanced] fsm init --base main did not resolve to the merge-base $fork"; exit 1; }
   mkfsmrun fsm-adv "$fork"
   eval "$rec --verdict PASS --mode subagent-adjudicated --from-run fsm-adv" >/dev/null 2>&1 ||
@@ -188,7 +188,7 @@ repo="$(mktemp -d)"
   got="$(verdict "$(run_gate)")"
   if [ "$got" != "PASS" ]; then echo "FAIL: [base-advanced] verdict=$got, want PASS"; exit 1; fi
   # Each records the base as typed beside the SHA it resolved to.
-  grep -q '"requested_base":"main"' ".metareview/runs/$run/audit.jsonl" || { echo "FAIL: [base-advanced] fsm init did not record the requested base"; exit 1; }
+  grep -q '"requested_base":"main"' ".git/metareview/runs/$run/audit.jsonl" || { echo "FAIL: [base-advanced] fsm init did not record the requested base"; exit 1; }
   grep -q '"kind":"review-evidence".*"requestedBase":"main"' .metareview/runs.jsonl || { echo "FAIL: [base-advanced] the marker did not record the requested base"; exit 1; }
   grep -q '"scope":"epic-ready".*"requestedBase":"main"' .metareview/runs.jsonl || { echo "FAIL: [base-advanced] the epic-ready run did not record the requested base"; exit 1; }
   grep -qF -- '- Requested base: `main`' docs/metareview/context/*epic-ready*-context.md ||

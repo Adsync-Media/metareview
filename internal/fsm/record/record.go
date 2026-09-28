@@ -11,6 +11,7 @@ import (
 	"github.com/dsifry/metareview/internal/jsonl"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -59,8 +60,10 @@ const (
 	StatusEscalated      = "escalated"
 )
 
-// root: store — the terminal row is store-level: run ids are unique across the store, and Exists checks it.
-func path(root string) string { return filepath.Join(root, ".metareview", "runs.jsonl") }
+// root: store — the terminal row is store-level: run ids are unique across the store, and Exists checks it. root is
+// git's common directory (#173): the ledger sits beside the runs, at <common>/metareview/runs.jsonl, not in any
+// checkout's per-worktree .metareview/runs.jsonl.
+func path(root string) string { return filepath.Join(root, "metareview", "runs.jsonl") } // root: store (git's common directory)
 
 // RowFor maps a terminal view to its row (spec 3 §6).
 func RowFor(v machine.View, now run.Time) Row {
@@ -86,8 +89,8 @@ func RowFor(v machine.View, now run.Time) Row {
 		SchemaVersion: 1, ID: v.RunID, Scope: "fsm-" + s.Workflow, Target: map[string]string{"type": "fsm", "id": s.Workflow + "@" + base},
 		Status: status, Verdict: verdict, ExecutionMode: "fsm", PreviousRunID: s.ParentRunID, AttemptNumber: attempt, MaxAttempts: machine.MaxAttempts,
 		BaseSHA: s.BaseSHA, HeadSHA: s.Head, CreatedAt: s.CreatedAt.UTC().Format(rfc3339Nano), UpdatedAt: now.UTC().Format(rfc3339Nano),
-		// root: store — FSMRunDir is relative to RepoRoot, the store root the run lives under.
-		RepoRoot: s.RepoRoot, Mock: s.Mock != "" || s.MockTainted, Outcome: string(s.Outcome), FSMRunDir: ".metareview/runs/" + v.RunID + "/",
+		// root: store — FSMRunDir is relative to git's common directory, where the store keeps the run (#173).
+		RepoRoot: s.RepoRoot, Mock: s.Mock != "" || s.MockTainted, Outcome: string(s.Outcome), FSMRunDir: "metareview/runs/" + v.RunID + "/",
 		WorkflowHash: s.WorkflowHash, WorkflowSource: source, EscalationReason: reason,
 	}
 }
@@ -131,7 +134,12 @@ type tail struct {
 // trailing newline that decodes is a row, an undecodable unterminated fragment is reported as the tail, any other
 // undecodable line is ERR_RUNS_JSONL{malformed}.
 func readRows(root string) ([]Row, tail, error) {
-	raw, err := os.ReadFile(path(root))
+	return readRowsFile(path(root))
+}
+
+// readRowsFile is readRows over any runs.jsonl file (the legacy checkout ledger, for migration).
+func readRowsFile(p string) ([]Row, tail, error) {
+	raw, err := os.ReadFile(p)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, tail{}, nil
 	}
@@ -217,7 +225,7 @@ func appendRow(root string, row Row) error {
 	}
 	var steps []func() error
 	if t.fragment != nil {
-		torn := filepath.Join(root, ".metareview", "runs", ".torn") // root: store
+		torn := filepath.Join(root, "metareview", "runs", ".torn") // root: store (git's common directory)
 		steps = append(steps,
 			func() error { return os.MkdirAll(torn, 0o700) },
 			func() error {
@@ -242,3 +250,74 @@ var flock = syscall.Flock
 
 // nanos is the torn-fragment name clock; tests may override it.
 var nanos = nowNanos
+
+// MigrateLegacyRows copies the FSM's terminal rows (scope fsm-*) from a 0.13.x store's ledger — the main checkout's
+// .metareview/runs.jsonl, which also holds that checkout's own review rows — into the common-dir ledger (#173), so
+// run ids stay unique across the store. Review rows are left alone and the legacy file is never modified.
+//
+// It runs on every fsm command, so it must be cheap and must not trust that file: the legacy ledger is the checkout's
+// LIVE review ledger, appended by lock-free writers, so a line that does not decode is skipped rather than failing
+// every fsm command; the common ledger is read once; and a stamp of the legacy file's size
+// (<common>/metareview/legacy-ledger.size) skips it entirely until it changes — an older binary appending more rows.
+// A legacy row whose id the ledger holds for a different head or workflow is a conflict, reported and not merged.
+// The rows of collided runs (ids MigrateLegacyRuns left in the legacy store because the store already holds a
+// different run of that id) stay behind with their runs: copying one would claim the id for the wrong run.
+func MigrateLegacyRows(checkout, common string, collided ...string) (copied, conflicts []string, err error) {
+	copied, conflicts = []string{}, []string{}
+	legacy := filepath.Join(checkout, ".metareview", "runs.jsonl") // root: store (the 0.13.x ledger)
+	info, err := os.Stat(legacy)
+	if errors.Is(err, os.ErrNotExist) {
+		return copied, conflicts, nil
+	}
+	if err != nil {
+		return copied, conflicts, err
+	}
+	stamp := filepath.Join(common, "metareview", "legacy-ledger.size") // root: store (git's common directory)
+	size := fmt.Sprint(info.Size())
+	if prev, err := os.ReadFile(stamp); err == nil && string(prev) == size {
+		return copied, conflicts, nil
+	}
+	raw, err := os.ReadFile(legacy)
+	if err != nil {
+		return copied, conflicts, err
+	}
+	present, _, err := readRows(common)
+	if err != nil {
+		return copied, conflicts, err
+	}
+	have := map[string]Row{}
+	for _, r := range present {
+		have[r.ID] = r
+	}
+	deferred := false // a collided run's row was left behind for a later pass
+	for _, line := range strings.Split(string(raw), "\n") {
+		var row Row
+		if json.Unmarshal([]byte(strings.TrimSpace(line)), &row) != nil || !strings.HasPrefix(row.Scope, "fsm-") {
+			continue // a review row, or a line a lock-free writer tore: not this migration's business
+		}
+		if slices.Contains(collided, row.ID) {
+			deferred = true
+			continue
+		}
+		if prev, ok := have[row.ID]; ok {
+			if prev.HeadSHA != row.HeadSHA || prev.WorkflowHash != row.WorkflowHash {
+				conflicts = append(conflicts, row.ID)
+			}
+			continue
+		}
+		// The run moves with it (MigrateLegacyRuns), so name it where it now lives, as RowFor does.
+		row.FSMRunDir = "metareview/runs/" + row.ID + "/" // root: store (git's common directory)
+		if err := appendRow(common, row); err != nil {
+			return copied, conflicts, err
+		}
+		have[row.ID] = row
+		copied = append(copied, row.ID)
+	}
+	// Best-effort: without the stamp the next call simply migrates again, idempotently. A pass that left a row behind
+	// — a collided run's, or one in conflict with the common ledger — does not stamp: the file will not change when
+	// that is resolved by hand, and the row must then migrate.
+	if !deferred && len(conflicts) == 0 {
+		_ = os.WriteFile(stamp, []byte(size), 0o600)
+	}
+	return copied, conflicts, nil
+}

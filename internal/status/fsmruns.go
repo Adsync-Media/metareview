@@ -6,10 +6,12 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/dsifry/metareview/internal/fsm/kind"
 	"github.com/dsifry/metareview/internal/fsm/run"
 	"github.com/dsifry/metareview/internal/fsm/workflow"
+	"github.com/dsifry/metareview/internal/repo"
 )
 
 // AbandonedRun is an FSM run that stopped somewhere that is not an ending.
@@ -53,6 +55,8 @@ type AbandonedRun struct {
 	// StopReason is what an operator recorded about why the run was left here, empty when they
 	// recorded nothing. It explains the entry; it never removes it.
 	StopReason string `json:"stopReason,omitempty"`
+	// workDir is the work dir the run's init recorded: which worktree started it (#173 scoping; not reported).
+	workDir string
 }
 
 // DiscoverAbandonedRuns reports FSM runs left in a non-terminal state.
@@ -69,14 +73,6 @@ func DiscoverAbandonedRuns(root string) []AbandonedRun {
 // disagrees with the judge type, and the caller above supplies neither — and an untestable
 // branch in a gate is the shape this repository keeps finding defects in.
 func discoverAbandonedRuns(root string, deps kind.Deps) []AbandonedRun {
-	// run-store: current-worktree. Deliberately NOT repo.RunStoreRoot yet: the shared store holds
-	// every worktree's runs, and blocking this checkout's Stop hook on another branch's abandoned run
-	// would be a false block. Branch-scoping comes first (#169 work plan, Phase 4).
-	dir := filepath.Join(root, ".metareview", "runs")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
 	reg, err := kind.New(deps)
 	if err != nil {
 		// A registry that will not build cannot say what a workflow's ending is, so nothing is
@@ -84,17 +80,111 @@ func discoverAbandonedRuns(root string, deps kind.Deps) []AbandonedRun {
 		// blockers: the report is narrower, never falsely clean about the reviews themselves.
 		return nil
 	}
-	out := []AbandonedRun{}
+	var out []AbandonedRun
+	readable := false // no runs directory anywhere reports nil, as it always has; an empty one reports []
+	seen := map[string]bool{}
+	// A run belongs to the worktree that CONTAINS its init work_dir (`fsm init --work-dir` takes any directory inside
+	// a worktree). The store is shared by every worktree (#173), so only this worktree's runs are reported — another
+	// branch's abandoned run must not block this checkout's Stop hook. A run whose work_dir cannot be attributed (its
+	// worktree was removed) is reported from the main checkout, never dropped: an unattributable run silently
+	// escaping every Stop gate would be the worse failure.
+	// Compare toplevel to toplevel: root may be a subdirectory repo.Root stopped at (a monorepo package with its
+	// own docs/metareview), which no run's containing worktree ever equals.
+	here := canonical(root)
+	if top, err := repo.Toplevel(root); err == nil {
+		here = canonical(top)
+	}
+	main := canonical(repo.RunStoreRoot(root))
+	store, storeErr := repo.StoreDir(root)
+	mine := func(r AbandonedRun) bool {
+		if r.workDir == "" || storeErr != nil {
+			return here == main
+		}
+		// The nearest surviving ancestor names the owner only when it is a checkout of THIS repository: a removed
+		// worktree's parent may sit inside an unrelated repository, whose toplevel matches no worktree here.
+		dir := enterableAncestor(r.workDir)
+		s, errStore := repo.StoreDir(dir)
+		owner, errTop := repo.Toplevel(dir)
+		if errStore != nil || errTop != nil || canonical(s) != canonical(store) {
+			return here == main
+		}
+		return canonical(owner) == here
+	}
+	// The 0.13.x location first, then the store: a migration renames a run from the first to the second, so a run
+	// moved mid-scan is seen in one or the other (and deduped by id), never missed by both.
+	// run-store: shared — the single 0.13.x location (the main checkout's .metareview/runs), read for one release
+	// until an fsm command migrates it; never any other worktree's directory.
+	sources := []string{filepath.Join(repo.RunStoreRoot(root), ".metareview", "runs")}
+	if storeErr == nil {
+		sources = append(sources, filepath.Join(store, "runs"))
+	}
+	for _, dir := range sources {
+		runs, ok := abandonedIn(dir, reg.Info())
+		readable = readable || ok
+		for _, r := range runs {
+			if !seen[r.RunID] && mine(r) {
+				out, seen[r.RunID] = append(out, r), true
+			}
+		}
+	}
+	if !readable {
+		return nil
+	}
+	if out == nil {
+		out = []AbandonedRun{}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].RunID < out[j].RunID })
+	return out
+}
+
+// LegacyRunsPending reports whether the main checkout still holds 0.13.x FSM runs that the next fsm command would
+// migrate into git's common directory (#173) — never bookkeeping, a non-run directory or a collision, which no
+// migration moves, so the warning it drives always clears once a command runs.
+func LegacyRunsPending(root string) bool {
+	store, err := repo.StoreDir(root)
+	if err != nil {
+		return false
+	}
+	// run-store: shared — the single 0.13.x location; store is <common>/metareview, so its parent is the common dir.
+	return len(run.PendingLegacyRuns(repo.RunStoreRoot(root), filepath.Dir(store))) > 0
+}
+
+// abandonedIn lists the abandoned runs directly under dir, and whether dir could be read at all.
+func abandonedIn(dir string, kinds map[string]workflow.KindInfo) ([]AbandonedRun, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, false
+	}
+	var out []AbandonedRun
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
-		if r, ok := abandonedRun(filepath.Join(dir, e.Name()), reg.Info()); ok {
+		if r, ok := abandonedRun(filepath.Join(dir, e.Name()), kinds); ok {
 			out = append(out, r)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].RunID < out[j].RunID })
-	return out
+	return out, true
+}
+
+// enterableAncestor is dir, or its nearest ancestor that is a directory and can be entered: a run whose work dir (a
+// subdirectory of its worktree) was deleted or locked still belongs to that worktree, and git can only run in a
+// directory it can enter.
+func enterableAncestor(dir string) string {
+	for d := filepath.Clean(dir); ; d = filepath.Dir(d) {
+		// X_OK: search permission; it holds for an executable file too, so require a directory.
+		if fi, err := os.Stat(d); (err == nil && fi.IsDir() && syscall.Access(d, 0x1) == nil) || d == filepath.Dir(d) {
+			return d
+		}
+	}
+}
+
+// canonical resolves symlinks so /var and /private/var, or a symlinked checkout, compare equal.
+func canonical(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return filepath.Clean(p)
 }
 
 func abandonedRun(dir string, kinds map[string]workflow.KindInfo) (AbandonedRun, bool) {
@@ -126,6 +216,7 @@ func abandonedRun(dir string, kinds map[string]workflow.KindInfo) (AbandonedRun,
 				// may legally declare a command called "stopped" — so reading `name` without
 				// checking the type let a guarded command annotate every run of its workflow.
 				Name     string          `json:"name"`
+				WorkDir  string          `json:"work_dir"`
 				Note     json.RawMessage `json:"data"`
 				Workflow string          `json:"workflow"`
 				Mock     string          `json:"mock"`
@@ -135,6 +226,9 @@ func abandonedRun(dir string, kinds map[string]workflow.KindInfo) (AbandonedRun,
 		}
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
 			continue
+		}
+		if ev.Type == run.TypeInit {
+			got.workDir = ev.Data.WorkDir
 		}
 		if ev.Type == run.TypeRecord && ev.Data.Name == StopNote {
 			// Last note wins: an operator may record a stop, resume the run, and record another.

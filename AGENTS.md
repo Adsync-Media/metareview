@@ -114,7 +114,7 @@ Keep transient state local:
 
 - `.metareview/findings.jsonl`
 - `.metareview/runs.jsonl`
-- `.metareview/runs/` (FSM runs; self-ignoring, incl. `.torn/`)
+- `<git-common-dir>/metareview/runs/` (FSM runs; the main checkout's `.git/metareview/runs/` — shared by every worktree, never tracked)
 - `.metareview/shards/` (transient prompt packs; self-ignoring)
 - generated binaries such as `bin/metareview`
 

@@ -44,9 +44,10 @@ func TestRunStoreRootResolvesMainWorktreeAndFallsBack(t *testing.T) {
 }
 
 // TestRunStoreReadersAreDeclared keeps #169 from recurring on a new surface: outside the FSM
-// (which owns the store), every line that builds a `.metareview/runs` path must have RunStoreRoot or
-// a `run-store:` declaration on it or within the three lines above. Checked per site, not per file,
-// so a second, undeclared reader in a file that already has a declared one still fails.
+// (which owns the store), every line that builds a runs path (`.metareview/runs`, or the common dir's
+// `store, "runs"`) must have RunStoreRoot, StoreDir or a `run-store:` declaration on it or within the three
+// lines above. Checked per site, not per file, so a second, undeclared reader in a file that already has a
+// declared one still fails.
 func TestRunStoreReadersAreDeclared(t *testing.T) {
 	const window = 3
 	repoRoot := filepath.Join("..", "..")
@@ -73,18 +74,18 @@ func TestRunStoreReadersAreDeclared(t *testing.T) {
 			for i, line := range lines {
 				// Comments mention the path too; only code builds it, and only code may count toward
 				// the non-vacuity check below.
-				if strings.HasPrefix(strings.TrimSpace(line), "//") || !strings.Contains(line, `".metareview", "runs"`) {
+				if strings.HasPrefix(strings.TrimSpace(line), "//") || (!strings.Contains(line, `".metareview", "runs"`) && !strings.Contains(line, `"metareview", "runs"`) && !strings.Contains(line, `store, "runs"`)) {
 					continue
 				}
 				sites++
 				declared := false
 				for j := max(0, i-window); j <= i; j++ {
-					if strings.Contains(lines[j], "RunStoreRoot(") || strings.Contains(lines[j], "run-store:") {
+					if strings.Contains(lines[j], "RunStoreRoot(") || strings.Contains(lines[j], "StoreDir(") || strings.Contains(lines[j], "run-store:") {
 						declared = true
 					}
 				}
 				if !declared {
-					t.Errorf("%s:%d builds a .metareview/runs path without RunStoreRoot or a `run-store:` declaration within %d lines above", path, i+1, window)
+					t.Errorf("%s:%d builds a .metareview/runs path without RunStoreRoot, StoreDir or a `run-store:` declaration within %d lines above", path, i+1, window)
 				}
 			}
 			return nil
