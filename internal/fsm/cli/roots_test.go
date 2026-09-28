@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,11 +12,12 @@ import (
 	"github.com/dsifry/metareview/internal/fsm/machine"
 )
 
-// linkedWorktree adds a detached linked worktree of the harness repo at HEAD and returns its real path.
+// linkedWorktree adds a linked worktree of the harness repo at HEAD, on its own branch (a run records the branch it is
+// for, #177), and returns its real path.
 func (h *harness) linkedWorktree() string {
 	h.t.Helper()
 	wt := filepath.Join(h.t.TempDir(), "linked")
-	git(h.t, h.root, "worktree", "add", "-q", "--detach", wt)
+	git(h.t, h.root, "worktree", "add", "-q", "-b", "linked-"+filepath.Base(filepath.Dir(wt)), wt)
 	real, err := filepath.EvalSymlinks(wt)
 	if err != nil {
 		h.t.Fatal(err)
@@ -257,5 +260,165 @@ func TestBareMainWorktreeAnchorsOnTheLinkedWorktree(t *testing.T) {
 	c.cwd = bare
 	if _, err := c.storeRoot(); err == nil {
 		t.Fatal("the bare directory itself has no checkout to anchor on")
+	}
+}
+
+// initBranch reads the branch a run's init event recorded (#177).
+func initBranch(t *testing.T, h *harness, id string) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(h.root, ".git", "metareview", "runs", id, "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ev struct {
+		Data struct {
+			Branch string `json:"branch"`
+		} `json:"data"`
+	}
+	first, _, _ := strings.Cut(string(raw), "\n")
+	if err := json.Unmarshal([]byte(first), &ev); err != nil {
+		t.Fatal(err)
+	}
+	return ev.Data.Branch
+}
+
+// #177: a run records the branch it is for — the checked-out one, or --for-branch — and a detached HEAD must name it.
+func TestInitRecordsTheBranchAndRequiresOneWhenDetached(t *testing.T) {
+	h := newHarness(t)
+	id := h.must(StatusOK, 0, h.mockInit()...)["run_id"].(string)
+	if got := initBranch(t, h, id); got != "main" {
+		t.Fatalf("init on main must record branch main, got %q", got)
+	}
+	// On a branch, --for-branch may only restate it: naming another would file this branch's run under that one, and
+	// an abandoned run would stop blocking the branch it was actually reviewing.
+	e := h.mustErr(CodeUsage, 2, append(h.mockInit(), "--for-branch", "elsewhere")...)
+	if d := e["error"].(map[string]any)["detail"].(string); !strings.Contains(d, "main") || !strings.Contains(d, "elsewhere") {
+		t.Fatalf("the refusal must name both branches: %v", e)
+	}
+	id = h.must(StatusOK, 0, append(h.mockInit(), "--for-branch", "main")...)["run_id"].(string)
+	if got := initBranch(t, h, id); got != "main" {
+		t.Fatalf("restating the checked-out branch is fine, got %q", got)
+	}
+	git(t, h.root, "branch", "feat")
+	git(t, h.root, "checkout", "-q", "--detach")
+	// Detached, the name must be a local branch: a typo, a remote-tracking name or a full ref would never match the
+	// name leg, so the run would be orphaned — blocking nothing — as soon as the real branch is rebased.
+	for _, bad := range []string{"fea", "origin/feat", "refs/heads/feat", "FEAT"} { // FEAT: a case-insensitive FS resolves it
+		e := h.mustErr(CodeUsage, 2, append(h.mockInit(), "--for-branch", bad)...)
+		if !strings.Contains(e["error"].(map[string]any)["detail"].(string), "not a local branch") {
+			t.Fatalf("--for-branch %s must be refused as not a local branch: %v", bad, e)
+		}
+	}
+	e = h.mustErr(CodeUsage, 2, h.mockInit()...)
+	if !strings.Contains(e["error"].(map[string]any)["detail"].(string), "--for-branch") {
+		t.Fatalf("the refusal must name --for-branch: %v", e)
+	}
+	id = h.must(StatusOK, 0, append(h.mockInit(), "--for-branch", "feat")...)["run_id"].(string)
+	if got := initBranch(t, h, id); got != "feat" {
+		t.Fatalf("--for-branch must be recorded, got %q", got)
+	}
+}
+
+// A symbolic-ref that fails for any reason other than git's "detached" (exit 1) is a git failure, never read as a
+// detached HEAD — which would tell the driver to pass --for-branch it does not need.
+func TestInitReportsASymbolicRefFailureAsGit(t *testing.T) {
+	h := newHarness(t)
+	realExec := h.deps.Exec
+	h.deps.Exec = func(ctx context.Context, dir string, env []string, args ...string) ([]byte, []byte, int, error) {
+		if len(args) > 0 && args[0] == "symbolic-ref" {
+			return []byte("fatal: broken"), nil, 128, nil
+		}
+		return realExec(ctx, dir, env, args...)
+	}
+	e := h.mustErr("ERR_GIT", 2, h.mockInit()...)
+	if strings.Contains(e["error"].(map[string]any)["detail"].(string), "detached") {
+		t.Fatalf("a git failure must not read as a detached HEAD: %v", e)
+	}
+}
+
+// A tag named like the branch makes git's short name "heads/<branch>"; init records the branch itself.
+func TestInitRecordsTheBranchBesideASameNamedTag(t *testing.T) {
+	h := newHarness(t)
+	git(t, h.root, "tag", "main")
+	id := h.must(StatusOK, 0, h.mockInit()...)["run_id"].(string)
+	if got := initBranch(t, h, id); got != "main" {
+		t.Fatalf("a same-named tag must not change the recorded branch, got %q", got)
+	}
+}
+
+// Checking --for-branch: git's "no" is not a local branch; git failing is ERR_GIT, with the failure itself.
+func TestInitForBranchCheckTellsGitFailingFromNo(t *testing.T) {
+	h := newHarness(t)
+	git(t, h.root, "branch", "feat")
+	git(t, h.root, "checkout", "-q", "--detach")
+	realExec := h.deps.Exec
+	fail := func(stdout []byte, code int, err error) {
+		h.deps.Exec = func(ctx context.Context, dir string, env []string, args ...string) ([]byte, []byte, int, error) {
+			if len(args) > 0 && args[0] == "for-each-ref" {
+				return stdout, nil, code, err
+			}
+			return realExec(ctx, dir, env, args...)
+		}
+	}
+	fail(nil, 128, nil)
+	e := h.mustErr("ERR_GIT", 2, append(h.mockInit(), "--for-branch", "feat")...)
+	if d := e["error"].(map[string]any)["detail"].(string); !strings.Contains(d, "for-each-ref exited 128") {
+		t.Fatalf("a failing check is git's failure, not a missing branch: %v", e)
+	}
+	fail(nil, -1, context.DeadlineExceeded)
+	e = h.mustErr("ERR_GIT", 2, append(h.mockInit(), "--for-branch", "feat")...)
+	if d := e["error"].(map[string]any)["detail"].(string); !strings.Contains(d, "deadline") {
+		t.Fatalf("a git that did not run says why: %v", e)
+	}
+}
+
+// On a case-insensitive filesystem `git checkout MAIN` lands on main with HEAD spelled MAIN; init records the branch
+// as git lists it, or status — comparing exactly — would never match the run again.
+func TestInitRecordsTheBranchAsGitListsIt(t *testing.T) {
+	h := newHarness(t)
+	git(t, h.root, "symbolic-ref", "HEAD", "refs/heads/MAIN")
+	if exec.Command("git", "-C", h.root, "rev-parse", "--verify", "--quiet", "refs/heads/MAIN").Run() != nil {
+		t.Skip("case-sensitive filesystem: MAIN is an unborn branch of its own, not main")
+	}
+	id := h.must(StatusOK, 0, h.mockInit()...)["run_id"].(string)
+	if got := initBranch(t, h, id); got != "main" {
+		t.Fatalf("a mis-cased HEAD must be recorded as the listed branch, got %q", got)
+	}
+	// Restating the checked-out branch in its HEAD spelling is still restating it.
+	id = h.must(StatusOK, 0, append(h.mockInit(), "--for-branch", "MAIN")...)["run_id"].(string)
+	if got := initBranch(t, h, id); got != "main" {
+		t.Fatalf("a mis-cased HEAD must be recorded as the listed branch, got %q", got)
+	}
+}
+
+// The fold decision, whatever the filesystem: a HEAD spelled MAIN is folded to main only when git resolves that
+// spelling; git's "no" leaves it (an unborn branch of its own on a case-sensitive filesystem); git failing is ERR_GIT.
+func TestInitFoldsAMisSpelledHEADOnlyWhenGitResolvesIt(t *testing.T) {
+	for _, c := range []struct {
+		code int
+		want string
+	}{{0, "main"}, {1, "MAIN"}, {128, ""}} {
+		h := newHarness(t)
+		realExec := h.deps.Exec
+		h.deps.Exec = func(ctx context.Context, dir string, env []string, args ...string) ([]byte, []byte, int, error) {
+			switch {
+			case len(args) > 0 && args[0] == "symbolic-ref":
+				return []byte("refs/heads/MAIN\n"), nil, 0, nil
+			case len(args) > 3 && args[0] == "rev-parse" && args[1] == "--verify" && args[3] == "refs/heads/MAIN":
+				return nil, nil, c.code, nil
+			}
+			return realExec(ctx, dir, env, args...)
+		}
+		if c.want == "" {
+			e := h.mustErr("ERR_GIT", 2, h.mockInit()...)
+			if d := e["error"].(map[string]any)["detail"].(string); !strings.Contains(d, "rev-parse exited 128") {
+				t.Fatalf("a failing check is git's failure: %v", e)
+			}
+			continue
+		}
+		id := h.must(StatusOK, 0, h.mockInit()...)["run_id"].(string)
+		if got := initBranch(t, h, id); got != c.want {
+			t.Fatalf("verify exit %d: recorded %q, want %q", c.code, got, c.want)
+		}
 	}
 }

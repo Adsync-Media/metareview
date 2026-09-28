@@ -200,11 +200,38 @@ Enforces review-before-push **in git**, not in a command-string parser (which is
   overwriting (an id in both places is a `STORE_COLLISION` warning, both copies kept) — and copies the legacy
   `fsm-*` ledger rows (read leniently — it is the main checkout's live review ledger — and skipped once migrated via
   a size stamp, `legacy-ledger.size`). For one release `record-lenses --from-run` and the `status` abandoned-run scan
-  also read that single legacy location (never another worktree's), and `status` warns while it holds runs. The scan
-  attributes a run to the worktree that *contains* its init `work_dir` (`--work-dir` may be a subdirectory) and
-  reports only this worktree's; a run whose worktree is gone is reported from the main checkout, never dropped —
-  with a bare main worktree (#174) there is none, so every worktree shows it as a warning naming the run dir to
-  delete, not a blocker.
+  also read that single legacy location (never another worktree's), and `status` warns while it holds runs.
+- **Branch scope (#177, `internal/scope`).** The abandoned-run scan classifies each run against the branch in hand,
+  one rule in one package: a run recorded on branch N at head H is **in scope** when N is the current branch or one
+  of its former names — the `git branch -m` / `-c` entries its reflog carries, while no live branch holds that name —
+  (the name leg: survives rebase, amend and rename; mid-rebase the branch being rebased is current; a rebase begun detached is no branch), or when H lies in
+  `merge-base(HEAD, main|master)..HEAD`, less anything a remote's own `main` or `master` (`refs/remotes/<remote>/main`) already has (the range leg:
+  detached snapshots, stacked branches; the exclusion keeps a stale local main from pulling merged branches' runs
+  into a branch cut from a fresh origin/main). Otherwise it is
+  **other-branch** while N exists, else **orphaned**; neither blocks, and `status --all` lists both, each with the
+  run directory to delete, without changing the exit code. Branch names are compared as full refnames, so a
+  same-named tag cannot unmatch them, and spelled as git lists them (`scope.Canonical`: on a case-insensitive
+  filesystem `git checkout Feat` lands on `feat` with HEAD spelled `Feat`; init records, and status compares, `feat` —
+  folded only when git resolves that spelling, so on a case-sensitive one an unborn `Feat` stays its own branch). `fsm init` records `branch` in its init event: the checked-out branch; on a
+  detached HEAD `--for-branch` is required and must name a local branch exactly as git lists it; on an attached one
+  it may only restate it. **Fail closed:** any git call `Load` makes that fails (other than git's own "detached")
+  leaves the scope unknown, and an unknown scope puts everything in scope. **Legacy runs** (before #177, no branch)
+  are in scope unless git shows their head belongs nowhere here: out of the range, not one of the current branch's
+  past reflog heads, and unreachable from HEAD (`merge-base --is-ancestor` exit 1) or pruned — so an upgrade never
+  silently clears one, but a pre-#177 run abandoned on main now blocks every branch forked after it until its
+  directory is deleted. `scope.Load` makes a fixed number of git calls however many runs there are (AC-4.9); only
+  legacy runs ask more, up to two calls per distinct head. **Known trade-offs:** a deleted branch name recreated for
+  unrelated work inherits the old name's runs (the name leg), and after a rename, recreating the old name hands the
+  runs recorded under it to the new branch, where they still block; `git checkout -b new` after a rewrite leaves the run
+  with the old branch, where it still blocks (and it is counted here); a repository that keeps no branch reflogs (a
+  bare one's default), or whose reflogs were expired, has no former names, so a rewrite then a rename orphans a run
+  there; from other checkouts a renamed branch's run reads as orphaned (only the renamed branch reads its own
+  reflog); a stack rebased as a whole keeps its base branch's runs on the base branch only; the range leg needs a
+  local `main` or `master`. a squash-merged (then deleted) lower branch of a stack keeps blocking the upper branch through the range leg until
+  it is rebased `--onto` main (the blocker names the lower branch); a detached HEAD other than a rebase (bisect, an
+  inspection checkout) has no name leg; "orphaned" means the recorded branch is gone, even when a live stacked branch
+  still holds its commits. Clearing a stale run is the closing operation's job. Findings are not yet branch-scoped
+  (#178 routes them through `internal/scope`).
 - **Store vs anchor vs work (#169, #172, #173).** Every `.metareview`/`docs` path in `internal/fsm` names which it
   means. **Common dir** = the shared store above. **Store root (anchor)** = the main worktree (`git worktree list
   --porcelain`, `repo.MainWorktreeFromPorcelain`), or with a bare main the linked worktree the command runs in (#174):

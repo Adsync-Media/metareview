@@ -23,6 +23,7 @@ import (
 	"github.com/dsifry/metareview/internal/fsm/mockai"
 	"github.com/dsifry/metareview/internal/fsm/run"
 	"github.com/dsifry/metareview/internal/fsm/workflow"
+	"github.com/dsifry/metareview/internal/scope"
 	"github.com/dsifry/metareview/workflows"
 )
 
@@ -113,7 +114,7 @@ func parseArgs(args []string) (*parsed, error) {
 				return nil, fmt.Errorf("--var expects K=V, got %q", v)
 			}
 			p.vars[k] = val
-		case "--workflow", "--base", "--goldens", "--repo-mode", "--allow-custom-cmds", "--mock-ai", "--work-dir", "--run-id", "--run", "--from", "--at-iter", "--node", "--data", "--input", "--kind", "--model", "--effort", "--context", "--check", "--a", "--b", "--out", "--max-bytes", "--judge-model", "--judge-effort":
+		case "--workflow", "--base", "--for-branch", "--goldens", "--repo-mode", "--allow-custom-cmds", "--mock-ai", "--work-dir", "--run-id", "--run", "--from", "--at-iter", "--node", "--data", "--input", "--kind", "--model", "--effort", "--context", "--check", "--a", "--b", "--out", "--max-bytes", "--judge-model", "--judge-effort":
 			p.flags[strings.TrimPrefix(a, "--")] = v
 		default:
 			return nil, fmt.Errorf("unknown option %s", a)
@@ -265,6 +266,61 @@ func (in *invocation) init() int {
 			return in.fail(base, err, phaseInit, false)
 		}
 	}
+	// The branch the run is for (#177): status scopes abandoned runs by it. A detached HEAD (a review snapshot) must
+	// name it — every run has an owning branch, so a rebase can never silently clear a detached run's gate. On a branch,
+	// --for-branch may only restate it: naming another would file this branch's run under that one, and an abandoned
+	// run would stop blocking the branch it actually reviewed.
+	branch, current := p.flags["for-branch"], ""
+	// The full refname: git's --short form reads "heads/feat" once a tag shares the name, which status would never
+	// match (internal/scope compares full refnames too).
+	gitFailed := func(op string, code int, err error) int {
+		detail := fmt.Sprintf("git %s exited %d", op, code)
+		if err != nil {
+			detail = fmt.Sprintf("git %s: %v", op, err)
+		}
+		return in.fail(base, errs.E(gate.CodeGit, detail, "op", op), phaseInit, false)
+	}
+	out, code, err := c.git(workDir, "symbolic-ref", "-q", "HEAD")
+	switch {
+	case err == nil && code == 0:
+		current = scope.BranchName(out)
+	case err != nil || code != 1: // 1 is git's "detached"; anything else is git failing, not a detached HEAD
+		return gitFailed("symbolic-ref", code, err)
+	}
+	// The branches exactly as git lists them: a name no local branch has would never match the name leg, so after a
+	// rebase the run would be orphaned and block nothing. A case-insensitive filesystem lets `git checkout Feat` land
+	// on feat with HEAD spelled Feat, and resolves refs/heads/FEAT to feat — status compares exactly, so the checked-out
+	// name is recorded as git lists it, and --for-branch must be spelled that way.
+	refs, code, err := c.git(workDir, "for-each-ref", "--format=%(refname)", "refs/heads")
+	if err != nil || code != 0 {
+		return gitFailed("for-each-ref", code, err)
+	}
+	branches := map[string]bool{}
+	for _, ref := range strings.Fields(refs) {
+		branches[scope.BranchName(ref)] = true
+	}
+	if current != "" && !branches[current] {
+		// Folded only when git resolves that spelling (a case-insensitive filesystem): on a case-sensitive one it is
+		// an unborn branch of its own.
+		switch _, code, err := c.git(workDir, "rev-parse", "--verify", "--quiet", "refs/heads/"+current); {
+		case err == nil && code == 0:
+			current = scope.Canonical(current, branches)
+		case err != nil || code != 1: // git's "no" is 1; anything else is git failing, as status treats it
+			return gitFailed("rev-parse", code, err)
+		}
+	}
+	if branch != "" && current == "" && !branches[branch] {
+		return in.usage("--for-branch " + strconv.Quote(branch) + " is not a local branch in " + workDir)
+	}
+	if current != "" && branch != "" && scope.Canonical(branch, branches) != current {
+		return in.usage("--for-branch " + branch + " names another branch than the one checked out in " + workDir + " (" + current + "); it is for a detached HEAD")
+	}
+	if current != "" {
+		branch = current // restated or not, the checked-out branch as git lists it
+	}
+	if branch == "" {
+		return in.usage("HEAD is detached in " + workDir + ": pass --for-branch <branch> to name the branch this run reviews for")
+	}
 	mockDir := p.flags["mock-ai"]
 	if mockDir == "" {
 		mockDir = c.deps.Getenv(EnvMockAI)
@@ -310,7 +366,7 @@ func (in *invocation) init() int {
 	// call time, so the model that judged a run is visible in its snapshot and
 	// its export. An override the audit cannot see would be worse than none.
 	vars := c.applyJudgeOverrideFor(p.vars, p.flags["judge-model"], p.flags["judge-effort"], p.bools["calibration"])
-	opts := machine.InitOptions{Workflow: wf, RunID: p.flags["run-id"], Vars: vars, Base: p.flags["base"], RepoMode: p.flags["repo-mode"], AllowCustomCmds: p.flags["allow-custom-cmds"], Calibration: p.bools["calibration"], MockDir: mockDir, GoldensPath: goldens, WorkDir: workDir, RepoRoot: root}
+	opts := machine.InitOptions{Workflow: wf, RunID: p.flags["run-id"], Vars: vars, Base: p.flags["base"], RepoMode: p.flags["repo-mode"], AllowCustomCmds: p.flags["allow-custom-cmds"], Calibration: p.bools["calibration"], MockDir: mockDir, GoldensPath: goldens, WorkDir: workDir, RepoRoot: root, Branch: branch}
 	m, err := machine.Init(c.ctx, md, opts)
 	if err != nil {
 		if errs.Is(err, machine.CodeCmdsNotAllowed) {
