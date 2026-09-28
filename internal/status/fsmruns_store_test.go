@@ -169,3 +169,119 @@ func TestCanonicalAndLegacyBookkeeping(t *testing.T) {
 		t.Error("a legacy store holding only its own bookkeeping has nothing to migrate")
 	}
 }
+
+// #174: with a bare main worktree there is no main checkout to own a run whose worktree is gone. Reporting it from
+// every worktree would block every session over a run none can advance; it is a warning in each instead — never a
+// blocker, never dropped. A run in a live worktree is still that worktree's own blocker.
+func TestBareMainOrphansRunsWhoseWorktreeIsGone(t *testing.T) {
+	base, _ := filepath.EvalSymlinks(t.TempDir())
+	bare := filepath.Join(base, "repo.git")
+	gitRun(t, base, "init", "-q", "--bare", "-b", "main", bare)
+	seed := filepath.Join(base, "seed")
+	gitRun(t, base, "clone", "-q", bare, seed)
+	gitRun(t, seed, "commit", "-q", "--allow-empty", "-m", "base")
+	gitRun(t, seed, "push", "-q", "origin", "main")
+	a, b := filepath.Join(base, "a"), filepath.Join(base, "b")
+	gitRun(t, bare, "worktree", "add", "-q", a, "main")
+	gitRun(t, bare, "worktree", "add", "-q", "-b", "feat", b)
+	writeStoreRun(t, bare, "mrv-a-live-00001", a)
+	writeStoreRun(t, bare, "mrv-gone-0000001", filepath.Join(base, "removed-worktree"))
+	writeStoreRun(t, bare, "mrv-gone-0000002", filepath.Join(base, "another-removed-worktree"))
+	for _, wt := range []string{a, b} {
+		abandoned, orphaned := ScanAbandonedRuns(wt)
+		if got := strings.Join(ids(orphaned), ","); got != "mrv-gone-0000001,mrv-gone-0000002" {
+			t.Fatalf("%s: the gone worktrees' runs are orphaned, in order: %s", wt, got)
+		}
+		for _, r := range abandoned {
+			if r.RunID == "mrv-gone-0000001" {
+				t.Fatalf("%s: an orphaned run must not be a blocker", wt)
+			}
+		}
+		r, err := Build(wt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(strings.Join(r.Warnings, "\n"), "mrv-gone-0000001") {
+			t.Fatalf("%s: status must warn about the orphaned run: %v", wt, r.Warnings)
+		}
+	}
+	if got := strings.Join(ids(DiscoverAbandonedRuns(a)), ","); got != "mrv-a-live-00001" {
+		t.Fatalf("worktree a keeps its own live run as a blocker, got %s", got)
+	}
+	if got := DiscoverAbandonedRuns(b); len(got) != 0 {
+		t.Fatalf("worktree b owns nothing, got %v", ids(got))
+	}
+}
+
+// #174 review: only a run whose work dir is really gone is orphaned. One whose work dir still exists but cannot be
+// resolved to this repository (a git lookup failing, or a dir outside any repository) stays a blocker. And the
+// warning names the directory the run is in — the 0.13.x legacy location when it was found there.
+func TestBareMainOrphansOnlyConfirmedRemovalsAndNamesTheRunDir(t *testing.T) {
+	base, _ := filepath.EvalSymlinks(t.TempDir())
+	bare := filepath.Join(base, "repo.git")
+	gitRun(t, base, "init", "-q", "--bare", "-b", "main", bare)
+	seed := filepath.Join(base, "seed")
+	gitRun(t, base, "clone", "-q", bare, seed)
+	gitRun(t, seed, "commit", "-q", "--allow-empty", "-m", "base")
+	gitRun(t, seed, "push", "-q", "origin", "main")
+	a := filepath.Join(base, "a")
+	gitRun(t, bare, "worktree", "add", "-q", a, "main")
+	live := filepath.Join(base, "exists-but-unresolvable") // exists, but no git lookup attributes it
+	if err := os.MkdirAll(live, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeStoreRun(t, bare, "mrv-unresolved01", live)
+	// A 0.13.x run in the legacy location (with a bare main: this worktree's .metareview/runs), worktree gone.
+	legacy := filepath.Join(a, ".metareview", "runs", "mrv-legacy-gone1")
+	if err := os.MkdirAll(legacy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(legacy, "workflow.yaml"), []byte(testWorkflow), 0o600)
+	_ = os.WriteFile(filepath.Join(legacy, "audit.jsonl"), []byte(`{"type":"init","at":"t","state":"discover","data":{"workflow":"t","work_dir":"`+filepath.Join(base, "gone")+`"}}`+"\n"+
+		`{"type":"transition","at":"t","state":"discover","data":{"to":"fix","to_kind":"agent-edit"}}`+"\n"), 0o600)
+
+	abandoned, orphaned := ScanAbandonedRuns(a)
+	if got := strings.Join(ids(orphaned), ","); got != "mrv-legacy-gone1" {
+		t.Fatalf("only the run whose work dir is gone is orphaned, got %s", got)
+	}
+	if got := strings.Join(ids(abandoned), ","); !strings.Contains(got, "mrv-unresolved01") {
+		t.Fatalf("a run whose work dir still exists stays a blocker, got %s", got)
+	}
+	r, err := Build(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := strings.Join(r.Warnings, "\n"); !strings.Contains(w, legacy) {
+		t.Fatalf("the warning must name the dir the run is in (%s): %s", legacy, w)
+	}
+}
+
+// #174 review: on an id collision (the migration keeps both copies) an orphaned legacy copy must not suppress the live
+// store copy of the same id — the blocker wins, and the id is not also warned about.
+func TestAnOrphanedLegacyCopyNeverSuppressesALiveStoreRun(t *testing.T) {
+	base, _ := filepath.EvalSymlinks(t.TempDir())
+	bare := filepath.Join(base, "repo.git")
+	gitRun(t, base, "init", "-q", "--bare", "-b", "main", bare)
+	seed := filepath.Join(base, "seed")
+	gitRun(t, base, "clone", "-q", bare, seed)
+	gitRun(t, seed, "commit", "-q", "--allow-empty", "-m", "base")
+	gitRun(t, seed, "push", "-q", "origin", "main")
+	a := filepath.Join(base, "a")
+	gitRun(t, bare, "worktree", "add", "-q", a, "main")
+	const id = "mrv-collide-00001"
+	legacy := filepath.Join(a, ".metareview", "runs", id) // scanned first; its worktree is gone
+	if err := os.MkdirAll(legacy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(legacy, "workflow.yaml"), []byte(testWorkflow), 0o600)
+	_ = os.WriteFile(filepath.Join(legacy, "audit.jsonl"), []byte(`{"type":"init","at":"t","state":"discover","data":{"workflow":"t","work_dir":"`+filepath.Join(base, "gone")+`"}}`+"\n"+
+		`{"type":"transition","at":"t","state":"discover","data":{"to":"fix","to_kind":"agent-edit"}}`+"\n"), 0o600)
+	writeStoreRun(t, bare, id, a) // the live copy: this worktree's
+	abandoned, orphaned := ScanAbandonedRuns(a)
+	if got := strings.Join(ids(abandoned), ","); got != id {
+		t.Fatalf("the live store copy must be this worktree's blocker, got %q", got)
+	}
+	if len(orphaned) != 0 {
+		t.Fatalf("an id that blocks must not also be warned about as orphaned: %v", ids(orphaned))
+	}
+}

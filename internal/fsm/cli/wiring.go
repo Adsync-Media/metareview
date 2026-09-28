@@ -107,7 +107,8 @@ func (c *ctxDeps) removeSandboxes() {
 //     (<common>/metareview/runs/<id>/), their terminal ledger (<common>/metareview/runs.jsonl; run ids are unique
 //     across it and record.Exists checks it), run listing, and escalation lineage — one store for the main checkout
 //     and every linked worktree, independent of any one checkout.
-//   - storeRoot — the repository anchor: the main worktree, whichever worktree the command runs in. It is a run's
+//   - storeRoot — the repository anchor: the main worktree, whichever worktree the command runs in (with a bare main,
+//     which has no checkout, the linked worktree the command runs in, #174). It is a run's
 //     RepoRoot (mock scenarios, escalation evidence and export paths resolve against a real checkout), and the
 //     0.13.x store it held (.metareview/runs/) is migrated into commonDir on first use.
 //   - workRoot — the checkout the command runs in: the default work dir a run reviews, and work output meant to be
@@ -117,8 +118,9 @@ func (c *ctxDeps) removeSandboxes() {
 // `root: work` declaration. TestFSMRootsAreDeclared is a tripwire for that over the literal path forms (split
 // elements and slash-joined strings), not proof: a path assembled any other way is not seen.
 
-// storeRoot resolves the main worktree of cwd (spec 5 §2): the first `worktree` line of `git worktree list --porcelain`;
-// a bare main or a non-repository is ERR_NOT_A_REPO.
+// storeRoot resolves the main worktree of cwd (spec 5 §2): the first `worktree` line of `git worktree list --porcelain`.
+// A bare main anchors on the worktree cwd is in (#174); a bare main with no checkout, or a non-repository, is
+// ERR_NOT_A_REPO.
 func (c *ctxDeps) storeRoot() (string, error) {
 	out, code, err := c.git(c.cwd, "worktree", "list", "--porcelain")
 	if err != nil || code != 0 {
@@ -127,6 +129,12 @@ func (c *ctxDeps) storeRoot() (string, error) {
 	// Shared with record-lenses' run lookup (repo.RunStoreRoot), so the writer and reader agree (#169).
 	path, bare := repo.MainWorktreeFromPorcelain(out)
 	if bare {
+		// A bare main worktree has no checkout to anchor on (#174). The store itself is in git's common directory
+		// (#173), so a command run from a linked worktree anchors on that worktree; from the bare directory itself
+		// there is no checkout at all.
+		if work, err := c.workRoot(); err == nil {
+			return work, nil
+		}
 		return "", errs.E(CodeNotARepo, "the main worktree is bare", "reason", "bare")
 	}
 	return path, nil

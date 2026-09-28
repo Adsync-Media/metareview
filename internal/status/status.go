@@ -223,7 +223,14 @@ func buildFor(root, target string, current map[string]bool) (Report, error) {
 			Kind:    UnreviewedKind,
 		})
 	}
-	r.Abandoned = DiscoverAbandonedRuns(root)
+	var orphaned []AbandonedRun
+	r.Abandoned, orphaned = ScanAbandonedRuns(root)
+	for _, o := range orphaned {
+		// A bare main worktree has no checkout to own a run whose worktree is gone (#174): say so in every worktree,
+		// without blocking any of them over a run none can advance.
+		r.Warnings = append(r.Warnings, "FSM run "+o.RunID+" ("+o.Workflow+" @ "+o.State+") was left mid-flight in a worktree that no "+
+			"longer exists; nothing can advance it — delete "+o.dir+" once you no longer need it")
+	}
 	if LegacyRunsPending(root) {
 		r.Warnings = append(r.Warnings, "0.13.x FSM runs are still in "+filepath.Join(repo.RunStoreRoot(root), ".metareview", "runs")+
 			"; any `metareview fsm` command migrates them into git's common directory")
