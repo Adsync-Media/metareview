@@ -41,7 +41,7 @@ func hooksPath(t *testing.T, root string, g GitRunner) string {
 // AlreadyDone, and Uninstall reverses it.
 func TestHookInstallCleanRepoRoundTrips(t *testing.T) {
 	root, g := tempRepo(t)
-	target, _ := filepath.Abs(filepath.Join(root, ".metareview", "git-hooks"))
+	target := hookTarget(t, root, g)
 
 	plan, err := PlanHookInstall(root, g)
 	if err != nil {
@@ -232,7 +232,7 @@ func TestUninstallPreviewStates(t *testing.T) {
 		t.Fatal("UninstallPreview on a non-git dir must fail closed")
 	}
 	root, g := tempRepo(t)
-	target, _ := filepath.Abs(filepath.Join(root, ".metareview", "git-hooks"))
+	target := hookTarget(t, root, g)
 	// Unset → nothing to change.
 	if st, err := UninstallPreview(root, g); err != nil || st.WouldChange || st.Current != "" {
 		t.Fatalf("unset core.hooksPath: WouldChange must be false; %+v err=%v", st, err)
@@ -254,9 +254,9 @@ func TestUninstallPreviewStates(t *testing.T) {
 }
 
 // The gate must reach a CONSUMER repo that has no committed hooks/git of its own: install MATERIALIZES the
-// embedded scripts into .metareview/git-hooks (executable) and points core.hooksPath there, so the gate is
-// genuinely active — not the old bug where core.hooksPath named a non-existent dir and the CLI still said
-// "active". Uninstall then removes the materialized dir.
+// embedded scripts into the repository's user-level hook dir (executable, #173) and points core.hooksPath there, so
+// the gate is genuinely active — not the old bug where core.hooksPath named a non-existent dir and the CLI still said
+// "active". Uninstall then unsets core.hooksPath and leaves the user-level dir.
 func TestHookInstallMaterializesHooksInConsumerRepo(t *testing.T) {
 	root, g := tempRepo(t)
 	plan, err := PlanHookInstall(root, g)
@@ -266,7 +266,7 @@ func TestHookInstallMaterializesHooksInConsumerRepo(t *testing.T) {
 	if err := ApplyHookInstall(root, plan, false, g); err != nil {
 		t.Fatal(err)
 	}
-	dir := filepath.Join(root, ".metareview", "git-hooks")
+	dir := hookTarget(t, root, g)
 	for _, name := range []string{"pre-push", "post-commit"} {
 		info, err := os.Stat(filepath.Join(dir, name))
 		if err != nil {
@@ -282,8 +282,12 @@ func TestHookInstallMaterializesHooksInConsumerRepo(t *testing.T) {
 	if _, err := UninstallHookInstall(root, g); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Fatalf("uninstall must remove the materialized hooks dir; stat err = %v", err)
+	// The user-level dir stays (#173): another live repository may run from it; a reinstall here reuses it.
+	if _, err := os.Stat(filepath.Join(dir, "pre-push")); err != nil {
+		t.Fatalf("uninstall must leave the user-level hook scripts; stat err = %v", err)
+	}
+	if got := hooksPath(t, root, g); got != "" {
+		t.Fatalf("uninstall must unset core.hooksPath, got %q", got)
 	}
 }
 
@@ -328,14 +332,16 @@ func TestHookInstallUpgradesLegacyTarget(t *testing.T) {
 	}
 }
 
-// If the hook scripts cannot be materialized (here: .metareview is a FILE, so mkdir fails), install must
+// If the hook scripts cannot be materialized (here: the user's data home is a FILE, so mkdir fails), install must
 // FAIL and must NOT set core.hooksPath — never leave the gate pointing at an empty/absent dir while claiming
 // it is active (the exact consumer-repo bug this whole change fixes).
 func TestApplyHookInstallFailsWhenHooksCannotMaterialize(t *testing.T) {
-	root, g := tempRepo(t)
-	if err := os.WriteFile(filepath.Join(root, ".metareview"), []byte("x"), 0o644); err != nil {
+	blocked := filepath.Join(isolateHooksHome(t), "data")
+	if err := os.WriteFile(blocked, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("XDG_DATA_HOME", blocked)
+	root, g := tempRepo(t)
 	plan, err := PlanHookInstall(root, g)
 	if err != nil {
 		t.Fatal(err)
@@ -389,7 +395,7 @@ func TestReinstallRematerializesMissingHooks(t *testing.T) {
 	if err := ApplyHookInstall(root, plan, false, g); err != nil {
 		t.Fatal(err)
 	}
-	dir := filepath.Join(root, ".metareview", "git-hooks")
+	dir := hookTarget(t, root, g)
 	if err := os.RemoveAll(dir); err != nil { // the scripts vanish, core.hooksPath still points here
 		t.Fatal(err)
 	}

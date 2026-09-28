@@ -1051,7 +1051,7 @@ func handleHookInstall(uninstall, yes, force, dryRun bool) {
 		_, _ = fmt.Fprintln(stdout, "metareview review gate — uninstall (git-native hooks)")
 		_, _ = fmt.Fprintln(stdout, "  Currently: core.hooksPath = "+current)
 		if !status.WouldChange {
-			_, _ = fmt.Fprintln(stdout, "\nNothing to uninstall — core.hooksPath is not metareview's hooks/git. No changes made.")
+			_, _ = fmt.Fprintln(stdout, "\nNothing to uninstall — core.hooksPath is not metareview's hook location. No changes made.")
 			return
 		}
 		_, _ = fmt.Fprintln(stdout, "  Will UNSET core.hooksPath — the pre-push gate and post-commit nudge stop running on this repo.")
@@ -1083,7 +1083,7 @@ func handleHookInstall(uninstall, yes, force, dryRun bool) {
 		if changed {
 			_, _ = fmt.Fprintln(stdout, "metareview: uninstalled — core.hooksPath unset; the git-native review gate no longer runs.")
 		} else {
-			_, _ = fmt.Fprintln(stdout, "metareview: nothing to uninstall — core.hooksPath was not metareview's hooks/git.")
+			_, _ = fmt.Fprintln(stdout, "metareview: nothing to uninstall — core.hooksPath was not metareview's hook location.")
 		}
 		return
 	}
@@ -1143,9 +1143,10 @@ func printHookPlan(plan setup.HookInstallPlan) {
 	}
 	_, _ = fmt.Fprintln(stdout, "metareview review gate — git-native hooks")
 	_, _ = fmt.Fprintln(stdout, "  Will write: the pre-push + post-commit hook scripts into "+plan.Target)
-	_, _ = fmt.Fprintln(stdout, "  Will set:   core.hooksPath = "+plan.Target+"   (this clone only)")
+	_, _ = fmt.Fprintln(stdout, "  Will set:   core.hooksPath = "+plan.Target+"   (this repository; its id is kept")
+	_, _ = fmt.Fprintln(stdout, "              in metareview.hooksId, and a pre-#173 .metareview/git-hooks is migrated)")
 	_, _ = fmt.Fprintln(stdout, "  Will add:   metareview's ephemeral-state block to .gitignore — ignore .metareview/* (runs,")
-	_, _ = fmt.Fprintln(stdout, "              findings, shards, the hook scripts) while keeping the durable learning files")
+	_, _ = fmt.Fprintln(stdout, "              findings, shards) while keeping the durable learning files")
 	_, _ = fmt.Fprintln(stdout, "              (knowledge/metareview.jsonl, calibration.jsonl, learning-runs.jsonl) committable")
 	_, _ = fmt.Fprintln(stdout, "  Currently:  core.hooksPath = "+current)
 	_, _ = fmt.Fprintln(stdout, "  Effect:     git runs the pre-push gate (BLOCKS an unreviewed push) and the")
