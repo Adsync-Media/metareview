@@ -134,19 +134,29 @@ func Load(root string, git Runner) Scope {
 	default:
 		return s
 	}
-	// Local branches, and the remote default branches (refs/remotes/<remote>/main|master for each configured remote —
-	// a remote name may itself contain a slash) whose commits the range leaves out.
+	// Local branches, and the remote default branches (for each configured remote — a remote name may itself contain a
+	// slash — the branch its HEAD names, and its main and master) whose commits the range leaves out.
 	remotes, err := git(root, "remote")
 	if err != nil {
 		return s
 	}
-	out, err := git(root, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes")
+	out, err := git(root, "for-each-ref", "--format=%(refname) %(symref)", "refs/heads", "refs/remotes")
 	if err != nil {
 		return s
 	}
-	defaults := remoteDefaultRefs(strings.Fields(remotes))
+	refs := map[string]string{} // refname -> the ref it points at, for a symbolic ref (a remote's HEAD)
+	var order []string
+	for _, line := range strings.Split(out, "\n") {
+		ref, target, _ := strings.Cut(strings.TrimSpace(line), " ")
+		if ref == "" {
+			continue
+		}
+		refs[ref] = strings.TrimSpace(target)
+		order = append(order, ref)
+	}
+	defaults := remoteDefaultRefs(strings.Fields(remotes), refs)
 	var remoteDefaults []string
-	for _, ref := range strings.Fields(out) {
+	for _, ref := range order {
 		if name := branchName(ref); name != "" {
 			s.branches[name] = true
 		} else if defaults[ref] {
@@ -218,13 +228,22 @@ func (s Scope) readReflog(root string, git Runner) error {
 	return nil
 }
 
-// remoteDefaultRefs is every configured remote's own main and master, spelled exactly: refs/remotes/origin/alice/main
-// is a namespaced branch on origin, not a default branch, while a remote named team/alice has refs/remotes/team/alice/main.
-func remoteDefaultRefs(remotes []string) map[string]bool {
+// remoteDefaultRefs is every configured remote's own default branches: the branch its refs/remotes/<r>/HEAD points at
+// (what `git clone` and `git remote set-head` record), and always its main and master. Names
+// are spelled exactly: refs/remotes/origin/alice/main is a namespaced branch on origin, not a default branch, while a
+// remote named team/alice has refs/remotes/team/alice/main. A HEAD that points outside its own remote proves nothing and
+// is ignored. listed maps each listed ref to its symref target (empty for an ordinary ref).
+func remoteDefaultRefs(remotes []string, listed map[string]string) map[string]bool {
 	refs := map[string]bool{}
 	for _, r := range remotes {
-		refs["refs/remotes/"+r+"/main"] = true
-		refs["refs/remotes/"+r+"/master"] = true
+		own := "refs/remotes/" + r + "/"
+		if head := listed[own+"HEAD"]; strings.HasPrefix(head, own) && head != own+"HEAD" {
+			refs[head] = true
+		}
+		// main and master stay excluded beside it: a HEAD recorded before a master-to-main rename, or naming develop in
+		// a gitflow repository, must not pull a fresh origin/main's merged work back into the range.
+		refs[own+"main"] = true
+		refs[own+"master"] = true
 	}
 	return refs
 }
