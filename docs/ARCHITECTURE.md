@@ -202,7 +202,15 @@ Enforces review-before-push **in git**, not in a command-string parser (which is
 - **Durable, committed** under `docs/metareview/`: review logs (`reviews/`), context packs (`context/`),
   shard results (`shards/`), FSM export bundles (`fsm/`), findings render (`FINDINGS.md`). ⚠️ Context packs
   can leak an absolute `cwd` (issue #80) — do not commit a leaking context artifact; the review `.md` is
-  clean.
+  clean. A gate log's `## Reviewer Results` has a row for every reviewer a finding names (the fixed set, then
+  e.g. `adversarial-review-reviewer`), and a blocker carried in from the ledger is tagged `Carried forward
+  from: <run>` under `## Blocking Findings` (#143) — both rendered by `findings.ReviewerTable` /
+  `ClassifiedMarkdown`, shared by task-done, pr-ready and epic-ready.
+- **Gate rollback** (`internal/rollback`, #152): a failed task-done / pr-ready / epic-ready / learning run puts
+  back the files it touched — write-temp-then-rename with the file's own mode, never a truncating write; a
+  symlinked output keeps its link — and removes what it created, the `FINDINGS.md` render included. A concurrent
+  render removed in that window is re-derived from its writer's ledger at that writer's next render; a render
+  left behind would outlive the restored ledger, and the carry-over would keep its unknown lines forever.
 - **`FINDINGS.md` merges as a union (#181).** Two branches that each regenerate it (a new blocker, a new
   override) conflict on a plain merge — both append to the end of the same lists — and a hand-resolved conflict
   in a generated file can silently drop a line. `.gitattributes` marks it `merge=union` (git's built-in driver,
@@ -424,7 +432,7 @@ list below is illustrative, omitting e.g. `judge`, `gate`, `converge`, `export`)
   rejection buckets; see `internal/lensoutput`'s package doc and the conformance corpus in
   `tests/go/test-lens-conformance.sh`).
 - **Review state & logs:** `reviewlog` (parse/discover `.md` logs), `reviewstate`, `reviewmanifest`,
-  `findings`, `runchain` (lineage), `state`/`jsonl` (append/scan), `reviewprompt`.
+  `findings`, `runchain` (lineage), `state`/`jsonl` (append/scan), `reviewprompt`, `rollback` (gate-run restore).
 - **Gate & install:** `setup` (mode/prereqs + hook install), `status` (branch scope, `CommitGate`/`PushGate`,
   `BuildForBranch`, coverage/unreviewed), `session` (binds a host session to the worktree its work is in, so
   the Stop hook `hooks/pre-finish.sh` evaluates that worktree rather than the checkout the host launched in —
