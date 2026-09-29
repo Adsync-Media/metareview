@@ -12,6 +12,7 @@ import (
 
 	"github.com/dsifry/metareview/internal/jsonl"
 	"github.com/dsifry/metareview/internal/markdown"
+	"github.com/dsifry/metareview/internal/scope"
 	"github.com/dsifry/metareview/internal/state"
 )
 
@@ -102,6 +103,9 @@ type Record struct {
 	UpdatedAt             string `json:"updatedAt"`
 	RepoRoot              string `json:"repoRoot"`
 	GitHead               string `json:"gitHead"`
+	// Branch is the branch the finding was recorded on (#178), empty on a detached HEAD and on rows from before
+	// branches were recorded. With GitHead it scopes the finding to its branch (see ScopedBlocking).
+	Branch string `json:"branch,omitempty"`
 }
 
 type Result struct {
@@ -112,6 +116,9 @@ type Result struct {
 }
 
 func Reconcile(root string, run Run, current []Input, options Options) (Result, error) {
+	// The branch in hand first, so its fixed git calls run before the ledger is read (only a legacy row's reachability
+	// check can still ask git inside the read-modify-write, once per distinct head).
+	sc := loadScope(root)
 	path := findingsPath(root)
 	existing, err := readJSONL(path)
 	if err != nil {
@@ -121,6 +128,30 @@ func Reconcile(root string, run Run, current []Input, options Options) (Result, 
 	if err != nil {
 		return Result{}, err
 	}
+	// One row per branch (#178). A finding raised again on another branch is that branch's own obligation, never a
+	// transfer: the branch that raised it first still has the defect until a fix reaches it. The branch in hand is the
+	// checkout's (scope.Load), and each rule below asks it one question:
+	//   - mine: the row is this branch's by name (its name, or a former one after a rename) — refreshed in place. No
+	//     other row is ever moved: a branchless row's recorded head is what ties it to the branches that contain it, so
+	//     a review on a throwaway detached commit must not carry it off a branch's history. (Where the scope is unreadable and
+	//     no branch is checked out — outside a repository, or a detached HEAD whose scope git failed to read — every
+	//     row is refreshed as before #178, and none re-stamped; a scope whose branch was read before a later git call
+	//     failed refreshes only the rows it owns, so a transient failure never carries another branch's row away.)
+	//   - blocksHere: the row gates this branch (scope.Classify) — counted in the verdict. A named run deduplicates
+	//     against a branchless row (from before #178, or a detached HEAD) that gates it only when the row's head is one
+	//     of the branch's own past heads (its reflog) — otherwise that row could later fall out of the branch's history
+	//     and leave it with no row of its own — and never re-stamps it; a detached run deduplicates against every row
+	//     that gates it, but a named run whose scope git failed to read only against its own rows — a transient failure
+	//     can at worst add a duplicate, never fold this branch's re-raise into another branch's row (when git cannot
+	//     even read which branch is checked out, the run is taken as detached; every row then still gates it); and a granted override that gates this branch (a
+	//     lower branch's accepted exception) absorbs the re-raise rather than demanding a second grant — only with a
+	//     readable scope, where "gates" means something;
+	//   - a --previous-run chain closes any row it names, whichever branch recorded it — the chain is the explicit
+	//     repair path, so a fix branch, a stacked branch or an epic can close what it inherited or merged, and a
+	//     deleted branch's row is never stranded.
+	branch := sc.Current
+	mine := func(record Record) bool { return sc.Owns(record.Branch) }
+	blocksHere := func(record Record) bool { return sc.Classify(record.Branch, record.GitHead) == scope.InScope }
 	previousRuns := previousRunSet(options)
 	resetRuns := resetRunSet(options)
 	currentFingerprints := map[string]bool{}
@@ -135,9 +166,14 @@ func Reconcile(root string, run Run, current []Input, options Options) (Result, 
 		if record.Status == "open" &&
 			record.Fingerprint != "" &&
 			currentFingerprints[record.Fingerprint] &&
-			sameRunTarget(record, run) {
+			sameRunTarget(record, run) &&
+			(mine(record) || !sc.Known() && branch == "") {
 			record.Scope = firstNonEmpty(record.Scope, run.Scope)
 			record.GitHead = firstNonEmpty(run.GitHead, record.GitHead)
+			// Its own row takes the branch's current name, so a rename then a rewrite keeps it.
+			if mine(record) {
+				record.Branch = branch
+			}
 			record.UpdatedAt = now
 		}
 		// Before the fix transition below: a summary is never "fixed", even from a chained run.
@@ -167,7 +203,7 @@ func Reconcile(root string, run Run, current []Input, options Options) (Result, 
 			record.UpdatedAt = now
 			record.GitHead = run.GitHead
 		}
-		if supersedesFreshness(record, run, options, currentFingerprints) {
+		if supersedesFreshness(record, run, options, currentFingerprints) && blocksHere(record) {
 			record.Status = StatusSuperseded
 			record.UpdatedAt = now
 			record.GitHead = run.GitHead
@@ -177,7 +213,11 @@ func Reconcile(root string, run Run, current []Input, options Options) (Result, 
 
 	activeExisting := map[string]bool{}
 	for _, record := range updated {
-		if record.Status != "fixed" && record.Status != StatusSuperseded && record.Fingerprint != "" && sameRunTarget(record, run) {
+		// Only fingerprints this run raised can be deduplicated; asking blocksHere first would spend git calls on the rest.
+		if record.Status != "fixed" && record.Status != StatusSuperseded && record.Fingerprint != "" &&
+			currentFingerprints[record.Fingerprint] && sameRunTarget(record, run) &&
+			(mine(record) || blocksHere(record) &&
+				(branch == "" || record.Branch == "" && sc.PastHead(record.GitHead) || sc.Known() && record.Status == StatusOverridden)) {
 			activeExisting[record.Fingerprint] = true
 		}
 	}
@@ -186,7 +226,7 @@ func Reconcile(root string, run Run, current []Input, options Options) (Result, 
 		if finding.Fingerprint != "" && activeExisting[finding.Fingerprint] {
 			continue
 		}
-		newRecords = append(newRecords, normalize(run, finding, len(newRecords)+1, now))
+		newRecords = append(newRecords, normalize(run, branch, finding, len(newRecords)+1, now))
 	}
 
 	all := append(updated, newRecords...)
@@ -197,12 +237,13 @@ func Reconcile(root string, run Run, current []Input, options Options) (Result, 
 		return Result{}, err
 	}
 	activeCurrent := make([]Record, 0, len(current))
-	openFindings := openForRun(all, run, options)
+	openFindings := slices.DeleteFunc(openForRun(all, run, options), func(r Record) bool { return !blocksHere(r) })
 	for _, record := range all {
 		if record.Status == "open" &&
 			record.Fingerprint != "" &&
 			currentFingerprints[record.Fingerprint] &&
-			sameRunTarget(record, run) {
+			sameRunTarget(record, run) &&
+			blocksHere(record) {
 			activeCurrent = append(activeCurrent, record)
 		}
 	}
@@ -795,12 +836,10 @@ var (
 	seamChmod       = func(name string, mode os.FileMode) error { return os.Chmod(name, mode) }
 )
 
+// UnresolvedBlocking is the unresolved blockers that belong to the branch in hand (#178): see ScopedBlocking.
 func UnresolvedBlocking(root string) ([]Record, error) {
-	records, err := readJSONL(findingsPath(root))
-	if err != nil {
-		return nil, err
-	}
-	return unresolvedBlockingFrom(records), nil
+	blockers, _, err := ScopedBlocking(root)
+	return blockers, err
 }
 
 // All returns every recorded finding regardless of status. The report
@@ -811,7 +850,7 @@ func All(root string) ([]Record, error) {
 	return readJSONL(findingsPath(root))
 }
 
-func normalize(run Run, finding Input, index int, createdAt string) Record {
+func normalize(run Run, branch string, finding Input, index int, createdAt string) Record {
 	owner := finding.Owner
 	if owner == "" {
 		owner = "implementer"
@@ -841,6 +880,7 @@ func normalize(run Run, finding Input, index int, createdAt string) Record {
 		UpdatedAt:          createdAt,
 		RepoRoot:           run.RepoRoot,
 		GitHead:            run.GitHead,
+		Branch:             branch,
 	}
 }
 

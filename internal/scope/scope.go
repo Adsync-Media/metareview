@@ -1,5 +1,5 @@
 // Package scope decides which recorded obligations belong to the branch in hand (#177). One rule, shared by the
-// abandoned-run scan (and, next, findings): an item recorded at commit H on branch N is in scope when N is the
+// abandoned-run scan and the findings ledger (#178, findings.ScopedBlocking): an item recorded at commit H on branch N is in scope when N is the
 // current branch or one of its former names (a `git branch -m`, or `-c`, its reflog records, while no live branch
 // holds that name) — which survives rebase, amend and rename — or when H lies in merge-base(HEAD, default base)..HEAD, which covers detached snapshots and stacked
 // branches. An item recorded before branches were (no N) is in scope unless git shows its head belongs nowhere here:
@@ -80,7 +80,8 @@ type Runner func(dir string, args ...string) (string, error)
 func RealRunner(dir string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	out, _, code, err := gate.RealExec(ctx, dir, nil, args...)
+	// No promisor fetches: a partial clone would otherwise go to the network for a pruned legacy head.
+	out, _, code, err := gate.RealExec(ctx, dir, []string{"GIT_NO_LAZY_FETCH=1"}, args...)
 	if err != nil {
 		return "", err
 	}
@@ -312,7 +313,7 @@ func (s Scope) Classify(branch, head string) Class {
 		return InScope
 	// A former name is this branch's only while no live branch holds it: a new branch that reuses the name owns
 	// what is recorded under it.
-	case branch != "" && (branch == s.Current || s.former[branch] && !s.branches[branch]):
+	case s.Owns(branch):
 		return InScope
 	case head != "" && s.inRange[head]:
 		return InScope
@@ -324,6 +325,20 @@ func (s Scope) Classify(branch, head string) Class {
 		return Orphaned
 	}
 }
+
+// Owns reports whether an item recorded on branch is the branch in hand's by name alone: the current branch, or one of
+// its former names that no live branch holds (Classify's name leg). A writer that keeps one row per branch uses it to
+// tell its own rows from another branch's without the range leg, which also takes in a stacked lower branch's items.
+// An unknown scope owns nothing but the current branch.
+func (s Scope) Owns(branch string) bool {
+	return branch != "" && (branch == s.Current || s.known && s.former[branch] && !s.branches[branch])
+}
+
+// Known reports whether Load could read the branch in hand; an unknown scope keeps everything in scope.
+func (s Scope) Known() bool { return s.known }
+
+// PastHead reports whether head is one the current branch has had (its reflog): proof the commit was this branch's.
+func (s Scope) PastHead(head string) bool { return s.pastHeads[head] }
 
 // reachable reports whether head is an ancestor of HEAD: one git call per distinct legacy head, and a second when
 // that one fails. Only git's own "no" (exit 1), or a commit git no longer has, is unreachable: a malformed head or a

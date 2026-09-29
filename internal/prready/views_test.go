@@ -141,9 +141,14 @@ func TestAnotherViewsRowIsNotAnUnresolvedBlocker(t *testing.T) {
 	edge := findings.Record{ID: "mrvf-earlier-001", RunID: "mrv-earlier", Scope: "pr-ready", Status: "open", Severity: "high",
 		Classification: "blocking", Title: "Mutation evidence stale (edge): src/e.ts changed", View: "edge",
 		Fingerprint: "mutation:stale:enforce:stryker:edge:src/e.ts:0123abcd", Target: map[string]any{"type": "branch", "id": "feature"}}
-	saved := unresolvedBlocking
-	t.Cleanup(func() { unresolvedBlocking = saved })
-	unresolvedBlocking = func(string) ([]findings.Record, error) { return []findings.Record{edge}, nil }
+	saved := scopedBlocking
+	t.Cleanup(func() { scopedBlocking = saved })
+	// The same row open on another branch (#178) is counted there only when this run's views include it.
+	elsewhere := edge
+	elsewhere.ID = "mrvf-elsewhere-001"
+	scopedBlocking = func(string) ([]findings.Record, []findings.Record, error) {
+		return []findings.Record{edge}, []findings.Record{elsewhere}, nil
+	}
 	for _, c := range []struct {
 		views []string
 		want  bool
@@ -155,6 +160,9 @@ func TestAnotherViewsRowIsNotAnUnresolvedBlocker(t *testing.T) {
 		log, _ := os.ReadFile(filepath.Join(root, res.ReviewRel))
 		if got := strings.Contains(string(log), "Unresolved review blockers"); got != c.want {
 			t.Errorf("views %v: unresolved review blockers %v, want %v", c.views, got, c.want)
+		}
+		if got := strings.Contains(string(log), "Open on other branches: 1 "); got != c.want {
+			t.Errorf("views %v: open on other branches %v, want %v", c.views, got, c.want)
 		}
 	}
 }

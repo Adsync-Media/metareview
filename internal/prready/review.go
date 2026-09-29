@@ -115,18 +115,18 @@ var runPRReadyReviewers = reviewers.RunPRReady
 // realistic inputs. restoreSnapshots/snapshot deliberately keep os.* directly so
 // a mkdirAll/writeFile override in a Create-error test cannot corrupt rollback.
 var (
-	marshalJSON        = json.Marshal
-	planShards         = contextprofile.PlanShards
-	collectKnowledge   = knowledge.Collect
-	discoverLogs       = reviewlog.Discover
-	unresolvedBlocking = findings.UnresolvedBlocking
-	allFindingsFn      = findings.All
-	collectGitHub      = githubcontext.Collect
-	resolveChainFn     = runchain.Resolve
-	reconcileFindings  = findings.Reconcile
-	appendJSONL        = state.AppendJSONL
-	mkdirAll           = os.MkdirAll
-	writeFile          = os.WriteFile
+	marshalJSON       = json.Marshal
+	planShards        = contextprofile.PlanShards
+	collectKnowledge  = knowledge.Collect
+	discoverLogs      = reviewlog.Discover
+	scopedBlocking    = findings.ScopedBlocking
+	allFindingsFn     = findings.All
+	collectGitHub     = githubcontext.Collect
+	resolveChainFn    = runchain.Resolve
+	reconcileFindings = findings.Reconcile
+	appendJSONL       = state.AppendJSONL
+	mkdirAll          = os.MkdirAll
+	writeFile         = os.WriteFile
 )
 
 type reviewerInput struct {
@@ -290,11 +290,13 @@ func Create(root string, options Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	blockers, err := unresolvedBlocking(root)
+	// Only this branch's blockers gate it (#178); the rest are counted in the log as an advisory.
+	blockers, elsewhere, err := scopedBlocking(root)
 	if err != nil {
 		return Result{}, err
 	}
 	blockers = slices.DeleteFunc(blockers, func(r findings.Record) bool { return !findings.InViewScope(r, options.MutationViews) })
+	elsewhere = slices.DeleteFunc(elsewhere, func(r findings.Record) bool { return !findings.InViewScope(r, options.MutationViews) })
 	// The full ledger (every status) lets the evidence renderer reconcile a
 	// historical review against how its findings were actually cleared (#40). Read
 	// before this run reconciles: the overrides/fixes that clear a historical
@@ -502,6 +504,7 @@ func Create(root string, options Options) (Result, error) {
 				ReusedFromRunID:      reused.RunID,
 				ReusedFromReviewPath: reused.Path,
 				HistoricalBlockers:   projection.HistoricalBlockers(),
+				ElsewhereBlockers:    len(elsewhere),
 			}
 			return writeFile(reviewPath, []byte(reviewMarkdown(runID, contextRel, options.PreviousRunID, gateEffect, reused.Verdict, reviewGit.ChangedFiles, nil, prEvidence, joinSections(reviewmanifest.ShardedReviewMarkdown(manifest, aggregate), mutationContext.FreshnessSection), meta)), 0o644)
 		}
@@ -564,6 +567,7 @@ func Create(root string, options Options) (Result, error) {
 			WarningFindingCount:  counts.Warnings,
 			ReviewInputDigest:    reviewInputDigest,
 			HistoricalBlockers:   projection.HistoricalBlockers(),
+			ElsewhereBlockers:    len(elsewhere),
 		}
 		return writeFile(reviewPath, []byte(reviewMarkdown(runID, contextRel, options.PreviousRunID, gateEffect, verdict, reviewGit.ChangedFiles, reconciled.OpenFindings, prEvidence, joinSections(reviewmanifest.ShardedReviewMarkdown(manifest, aggregate), mutationContext.FreshnessSection), meta)), 0o644)
 	}()
@@ -1367,6 +1371,9 @@ type reviewMetadata struct {
 	ReusedFromRunID      string
 	ReusedFromReviewPath string
 	HistoricalBlockers   []findings.Record
+	// ElsewhereBlockers counts the unresolved blockers in this checkout's ledger that belong to another branch, or
+	// to none (#178): listed, never blocking.
+	ElsewhereBlockers int
 }
 
 func verdictForCounts(counts findings.ClassCounts, gateEffect string, attemptNumber, maxAttempts int, staleOnly bool) (string, string, bool, string) {
@@ -1429,15 +1436,18 @@ func reviewMarkdown(runID, contextRel, previousRun, gateEffect, verdict string, 
 		"## Verdict\n\n" + verdict + "\n\n" + shardedReview +
 		reviewerResults +
 		"\n## Suggested PR Evidence\n\n" + prEvidence + "\n" +
-		repositoryHealthMarkdown(meta.HistoricalBlockers) +
+		repositoryHealthMarkdown(meta.HistoricalBlockers, meta.ElsewhereBlockers) +
 		runChainMarkdown(runID, verdict, meta)
 }
 
-func repositoryHealthMarkdown(records []findings.Record) string {
-	if len(records) == 0 {
+func repositoryHealthMarkdown(records []findings.Record, elsewhere int) string {
+	if len(records) == 0 && elsewhere == 0 {
 		return ""
 	}
-	lines := make([]string, 0, len(records))
+	lines := make([]string, 0, len(records)+1)
+	if elsewhere > 0 {
+		lines = append(lines, fmt.Sprintf("- Open on other branches: %d unresolved blocker(s) in this checkout's findings ledger belong to another live branch, which they still block, or to none (merged and deleted, or outside this history), where they block nothing; none blocks this branch.", elsewhere))
+	}
 	for _, record := range records {
 		title := strings.TrimSpace(strings.NewReplacer("\n", " ", "\r", " ").Replace(record.Title))
 		if title == "" {
