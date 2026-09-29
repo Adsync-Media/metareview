@@ -606,3 +606,139 @@ func TestRequestOverrideAcceptsAFixedFindingWithAnEscalationReference(t *testing
 		t.Fatal("a fixed finding without an escalation reference must stay refused")
 	}
 }
+
+// #179: an ID nothing knows takes the subject row the caller supplies — an abandoned FSM run's closure — and only when
+// the subject names that ID; the row then goes through the ordinary two-phase flow.
+func TestAnOverrideTakesItsSubjectOnlyForTheIDItNames(t *testing.T) {
+	root := t.TempDir()
+	subject := AbandonedRunRecord("mrv-run-1", "(t @ fix)", "feat", "abc", "u1", "t0")
+	request := OverrideRequest{By: "claude-agent", Reason: "a run nobody will finish", Now: "t1", Subject: &subject}
+	if err := RequestOverride(root, "mrv-run-2", request); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("a subject for another ID must not be taken: %v", err)
+	}
+	request.Subject = nil
+	if err := RequestOverride(root, "mrv-run-1", request); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("no subject, no row: %v", err)
+	}
+	request.Subject = &subject
+	if err := RequestOverride(root, "mrv-run-1", request); err != nil {
+		t.Fatal(err)
+	}
+	got := loadOne(t, root)
+	if got.ID != "mrv-run-1" || got.Status != StatusOverridePending || got.Scope != "fsm-run" || got.Branch != "feat" ||
+		got.GitHead != "abc" || got.Title != "Abandoned FSM run (t @ fix)" || got.CreatedAt != "t0" || IsBlockingClass(got) || !IsRunClosure(got) {
+		t.Fatalf("got %+v", got)
+	}
+	if err := GrantOverride(root, "mrv-run-1", OverrideGrant{By: "claude-agent", Reason: "self-granted exception", Now: "t2", Subject: &subject}); err == nil {
+		t.Fatal("the requester cannot grant")
+	}
+	if err := GrantOverride(root, "mrv-run-1", OverrideGrant{By: "maintainer", Reason: "accepted exception here", Now: "t2", Subject: &subject}); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadOne(t, root); got.Status != StatusOverridden || got.OverrideGrantedBy != "maintainer" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestIsRunClosure(t *testing.T) {
+	row := AbandonedRunRecord("mrv-run-1", "x", "", "", "u1", "t")
+	if !IsRunClosure(row) {
+		t.Fatal("a closure row")
+	}
+	row.ID = "mrv-run-2"
+	if IsRunClosure(row) {
+		t.Fatal("a row whose ID is not the run its fingerprint names is not a closure")
+	}
+	if IsRunClosure(openBlocker("mrvf-1")) {
+		t.Fatal("a finding is not a closure")
+	}
+}
+
+// #179 review: a run closure's Process Overrides line is keyed by the run's ID (mrv-…), and carry-over must keep it when
+// FINDINGS.md is re-rendered from a ledger without the row (another worktree, a fresh clone) — it is the durable record.
+func TestARunClosureLineIsCarriedOver(t *testing.T) {
+	root := t.TempDir()
+	subject := AbandonedRunRecord("mrv-20260929-000000000000000-fsm-t-1", "(t @ fix)", "", "", "u1", "t0")
+	if err := GrantOverride(root, subject.ID, OverrideGrant{By: "maintainer", Reason: "accepted: abandoned for good", Now: "t1", Subject: &subject}); err != nil {
+		t.Fatal(err)
+	}
+	index := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
+	rendered, err := os.ReadFile(index)
+	if err != nil || !strings.Contains(string(rendered), "- "+subject.ID+" [granted]") {
+		t.Fatalf("rendered %s (%v)", rendered, err)
+	}
+	if err := os.Remove(findingsPath(root)); err != nil { // another checkout: the ledger has no such row
+		t.Fatal(err)
+	}
+	if err := RenderIndex(root); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := os.ReadFile(index); !strings.Contains(string(again), "- "+subject.ID+" [granted] Abandoned FSM run (t @ fix) — granted by maintainer") {
+		t.Fatalf("the closure line must be carried over:\n%s", again)
+	}
+}
+
+// A granted closure whose run has moved on since (a different snapshot) may be requested and granted afresh; one whose
+// run has not is still refused, and the grant records the snapshot it closed.
+func TestAStaleRunClosureCanBeReopened(t *testing.T) {
+	root := t.TempDir()
+	first := AbandonedRunRecord("mrv-run-1", "(t @ fix)", "", "", "u1", "t0")
+	if err := GrantOverride(root, "mrv-run-1", OverrideGrant{By: "maintainer", Reason: "accepted first abandonment", Now: "t1", Subject: &first}); err != nil {
+		t.Fatal(err)
+	}
+	request := OverrideRequest{By: "claude-agent", Reason: "abandoned again after a resume", Now: "t2", Subject: &first}
+	if err := RequestOverride(root, "mrv-run-1", request); err == nil || !strings.Contains(err.Error(), "overridden, not open") {
+		t.Fatalf("an unchanged run's granted closure is final: %v", err)
+	}
+	moved := AbandonedRunRecord("mrv-run-1", "(t @ fix)", "", "", "u2", "t2")
+	request.Subject = &moved
+	if err := RequestOverride(root, "mrv-run-1", request); err != nil {
+		t.Fatal(err)
+	}
+	got := loadOne(t, root)
+	if got.Status != StatusOverridePending || got.RunUpdated != "u2" || got.OverrideGrantedBy != "" || got.OverrideRequestedBy != "claude-agent" {
+		t.Fatalf("reopened: %+v", got)
+	}
+	if err := GrantOverride(root, "mrv-run-1", OverrideGrant{By: "maintainer", Reason: "accepted again, for good", Now: "t3", Subject: &moved}); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadOne(t, root); got.Status != StatusOverridden || got.RunUpdated != "u2" || got.OverrideRequestedBy != "claude-agent" {
+		t.Fatalf("re-granted: %+v", got)
+	}
+	// A human may also re-grant a stale closure directly; the earlier request no longer applies to it.
+	again := AbandonedRunRecord("mrv-run-1", "(t @ fix)", "", "", "u3", "t4")
+	if err := GrantOverride(root, "mrv-run-1", OverrideGrant{By: "claude-agent", Reason: "closing the third abandonment", Now: "t4", Subject: &again}); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadOne(t, root); got.RunUpdated != "u3" || got.OverrideRequestedBy != "" || got.OverrideGrantedBy != "claude-agent" {
+		t.Fatalf("direct re-grant: %+v", got)
+	}
+	// A finding is never a stale closure.
+	if staleClosure(openBlocker("mrvf-1"), &again) {
+		t.Fatal("a finding is not a closure")
+	}
+}
+
+// #179 review: a pending request made before its run moved no longer describes the run. A grant then is a direct
+// decision on the run as it stands (the stale request is dropped, not acknowledged), and the request can be re-filed.
+func TestAStalePendingClosureIsNotAcknowledgedAsIs(t *testing.T) {
+	root := t.TempDir()
+	asked := AbandonedRunRecord("mrv-run-1", "(t @ fix)", "", "", "u1", "t0")
+	if err := RequestOverride(root, "mrv-run-1", OverrideRequest{By: "claude-agent", Reason: "a run nobody will finish", Now: "t1", Subject: &asked}); err != nil {
+		t.Fatal(err)
+	}
+	moved := AbandonedRunRecord("mrv-run-1", "(t @ discover)", "", "", "u2", "t2")
+	if err := RequestOverride(root, "mrv-run-1", OverrideRequest{By: "other-agent", Reason: "asking again for the new state", Now: "t2", Subject: &moved}); err != nil {
+		t.Fatalf("a stale pending request can be re-filed: %v", err)
+	}
+	if got := loadOne(t, root); got.OverrideRequestedBy != "other-agent" || got.RunUpdated != "u2" || got.Status != StatusOverridePending {
+		t.Fatalf("re-filed: %+v", got)
+	}
+	later := AbandonedRunRecord("mrv-run-1", "(t @ fix)", "", "", "u3", "t3")
+	if err := GrantOverride(root, "mrv-run-1", OverrideGrant{By: "other-agent", Reason: "closing it as it stands now", Now: "t3", Subject: &later}); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadOne(t, root); got.Status != StatusOverridden || got.OverrideRequestedBy != "" || got.RunUpdated != "u3" {
+		t.Fatalf("a grant on a stale request is a direct decision on the current state: %+v", got)
+	}
+}
