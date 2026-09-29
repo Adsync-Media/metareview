@@ -315,11 +315,11 @@ Enforces review-before-push **in git**, not in a command-string parser (which is
   with `-`, so no new such logs can be written. pr-ready does *not* infer from heads or branches that a review
   covered someone else's landed work: task-done also reviews uncommitted changes and records only HEAD, so any such
   inference fails open under rebases, renames, detached checkouts or a moving base. Any other stale blocker is
-  meant to be cleared by a human-granted process override; making that reach blockers that exist only in
-  committed review logs is tracked in #188.
+  meant to be cleared by a human-granted process override, which reaches blockers that exist only in committed
+  review logs (#188, below).
 - **Run lineage:** a NEEDS_REVISION parent is retired when a clean same-target+same-kind child links via
   `previousRunId` (supersede). Repair via `--previous-run <run-id>`; never `git add -A` failed-run artifacts. A chained
-  pr-ready run's lineage also holds every earlier pr-ready run of the same target over the same base..head as a run in
+  pr-ready run's lineage also holds every earlier pr-ready run (with an authenticated run record) of the same target over the same base..head as a run in
   its chain (mr-mrf): a standalone re-run at that diff was the same review, so the repair chain can close its findings.
   A run with no `--previous-run` adopts nothing — a fresh look at an unchanged diff is never a fix.
 - **Evidence receipts:** `evidence run -- <cmd>` records a validation receipt (kind + exitCode + hashes);
@@ -329,7 +329,16 @@ Enforces review-before-push **in git**, not in a command-string parser (which is
   with `--previous-run`. Editing a file invalidates only its own shard.
 - **Overrides** (`override request` / `grant`): requesting does NOT clear the gate; granting must come from
   **outside** the workflow (a human/authority) — the requester cannot grant. `--by` is audit metadata, not
-  authentication. An override is never a fix (`fixedInRunId` stays empty).
+  authentication. An override is never a fix (`fixedInRunId` stays empty). An ID with no ledger row is looked up in the
+  committed review logs (#188): every log listing it under `## Blocking Findings` supplies it **and all its other
+  blockers** (pr-ready clears a log once every ID the ledger knows is resolved, so importing one alone would let its
+  grant retire the rest). The scan runs on every override, not only for an unknown ID — a finding imported as one log's
+  sibling may be listed by another log whose own blockers are still unknown — and never takes pr-ready's derived
+  "Unresolved review blockers" summary as a sibling (every pr-ready run re-derives it). Each is imported as this branch's open row at HEAD — its run is the one its ID names, taken
+  from that run's own log where committed, else from a log that carries it forward; header fields are read above the
+  first `## ` only — with fingerprint `imported-review-log:<id>` (never a live finding's) and the log as evidence. A
+  `--previous-run` chain naming its run closes it as fixed. An ID found nowhere exits 1. Unscoped `status` still
+  lists a committed log with no local run record (#147: the ledger never clears an unauthenticated log).
 
 ## 7. Cross-agent integration
 
