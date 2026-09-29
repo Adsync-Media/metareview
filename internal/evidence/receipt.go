@@ -63,12 +63,59 @@ var (
 		regexp.MustCompile(`(?i)\b(npm run build|build|tsc --noEmit|typecheck|coverage).*\b(pass|passed|ok|success|exited 0)\b`),
 		regexp.MustCompile(`(?i)\bexited 0\b`),
 	}
+	// failurePatterns read a failure fail-closed: any "fail"/"failed" (as the base reader's (?i)\bFAIL\b did), and the
+	// shapes tools print, count. hasFailureSignal first strips ANSI escapes and neutralizes zero reports (zeroClause,
+	// zeroLabel); then a counted "fail" (countFail, a modal "1 should fail" aside) counts; then "did/does fail" becomes "failed" (reportedFail); and only
+	// then is prose "fail" neutralized (proseFail, mr-r3y) — that order is what keeps the exemption from hiding a count
+	// or a report.
 	failurePatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\b(exit(ed)?|exit code)\s+[1-9][0-9]*\b`),
-		regexp.MustCompile(`(?i)\bFAIL\b`),
-		regexp.MustCompile(`(?i)\bfailed\b`),
+		regexp.MustCompile(`(?i)\b(exit(ed)?|exit[ _-]?code|exit[ _-]?status|return[ _-]?code|exited with( code| status)?|exit (code|status) (was|is))\s*[:=]?\s*-?[1-9][0-9]*\b|\brc[ \t]*[:=][ \t]*-?[1-9]`),
+		regexp.MustCompile(`\bFAIL(URES?)?\b`),                                                                                              // FAIL, BUILD FAILURE, FAILURES! (upper case)
+		regexp.MustCompile(`(?im)(^|[^/\w])fail($|[^-.\w]|-($|\W)|\.($|\W))`),                                                               // "fail" in any case — not a path segment (TestX/fail), file (fail.test.ts) or compound (Fail-safe); prose is neutralized first (proseFail)
+		regexp.MustCompile(`(?i)\bfailed\b`),                                                                                                // any form: "Failed: 1", "Command failed.", "go vet failed"
+		regexp.MustCompile(`(?i)\b(failures?|errors?)[ \t]*[:=][ \t]*[1-9]`),                                                                // junit/maven "Failures: 1", "Errors: 2"
+		regexp.MustCompile(`(?i)\b[1-9][0-9]*[ \t]+(\w+[ \t]+)?(failing|failures?)\b`),                                                      // mocha "1 failing", "2 tests failing", "1 failure"
+		regexp.MustCompile(`(?im)\b[1-9][0-9]*[ \t]+errors?([ \t]*([.,;:)]|\r?$)|[ \t]+(in|during|generated|found|occurred|and)\b)`),        // "1 error in 0.1s", "2 errors and 1 warning" — not "2 error paths"
+		regexp.MustCompile(`(?m)^(ERROR|Killed)\b|^Traceback \(most recent call last\)`),                                                    // pytest ERROR lines, OOM kill, Python traceback
+		regexp.MustCompile(`\bSegmentation fault\b|\berror\[E[0-9]+\]|\bpanicked at\b|\bException in thread\b|(?i)\bunhandled exception\b`), // crashes, rustc, panics
+		regexp.MustCompile(`\b[A-Z][A-Za-z]*(Error|Exception)\b( \[\w+\])?:`),                                                               // TypeError:, AssertionError [ERR_ASSERTION]:
+		regexp.MustCompile(`(?m)^[^\s:]+\.go:[0-9]+(:[0-9]+)?: |(?i)\b[1-9][0-9]*[ \t]+issues?:`),                                           // go build/vet/lint diagnostics, golangci-lint "1 issues:"
+		regexp.MustCompile(`(?m)^[ \t]*not ok\b`),                                                                                           // TAP, including indented subtests
+		regexp.MustCompile(`\bError[ \t]+[1-9][0-9]*\b`),                                                                                    // make "*** [test] Error 2"
+		regexp.MustCompile(`\berror (TS|CS)[0-9]+`),                                                                                         // tsc, MSBuild
+		regexp.MustCompile(`(?i)\bnpm (ERR!|error)`),
 		regexp.MustCompile(`(?i)\berror:`),
 	}
+	// zeroClause and zeroLabel report that nothing failed; they are neutralized before failurePatterns run. Both are
+	// narrow on purpose, so they can never swallow a real failure:
+	//   - zeroClause: 0/no/none, optionally "of N" or "/N", one noun from a fixed list, then fail, failed, failing,
+	//     failures or errors, STARTING a clause (line start, comma, semicolon, bracket or pipe) and ending one (a
+	//     delimiter or line end, optionally after "in <duration>" or "out of N"): "…, 0 failed", "no tests failed",
+	//     "none of the checks failed", "0 of 10 failed in 1s", bun "0 fail", ctest "0 tests failed out of 5".
+	//     "shard 0 failed", "Passed: 0 Failed: 3" and "0 passed 3 failed" stay failures;
+	//   - zeroLabel: a label with a zero count that ends there — "Failed: 0, Passed: 5", "failed=0 skipped=0",
+	//     "# fail 0", "Errors: 0" — never "Error: 0 is not a valid port". A following "key=" is kept (${1}), so
+	//     "failed=0 errors=3" still reads the errors.
+	zeroClause = regexp.MustCompile(`(?im)(^|[,;(|])[ \t]*(0|no|none)([ \t]+of([ \t]+the)?([ \t]+[0-9]+)?|/[0-9]+)?[ \t]+((tests?|checks?|specs?|examples?|cases?|suites?)[ \t]+)?(fail|failed|failing|failures?|errors?)([ \t]+in[ \t]+[0-9.]+[mµn]?s|[ \t]+out of[ \t]+[0-9]+)?[ \t]*([,;.)(|!]|\r?$)`)
+	zeroLabel  = regexp.MustCompile(`(?m)\b(?:(?i:failed|failures?|errors)[ \t]*[:=]|fail[ \t]*[:=]?)[ \t]*0(?:[ \t]*(?:[,;)|]|\r?$)|[ \t]+(\w+=))`)
+	// proseFail is the one exemption the base reader lacked (mr-r3y): a lower-case "fail" in a prose sentence — after a
+	// hypothetical or negated modal, as in a test's name ("should fail (3 ms)", "must fail", "doesn't fail"), or after a
+	// subject word and before against/without ("the new tests fail against origin/main", "fail without the fix"). Not
+	// "to fail" ("continues to fail" reports a failure; only "expected to fail" is hypothetical), nor "fail before".
+	// Never "did/does fail" (a report, rewritten to "failed" first),
+	// never upper or title case (a verdict), never after ":" or "=" ("Status: fail on windows"). It is neutralized after
+	// a counted "fail" ("2 tests fail on windows") has already been read as a failure.
+	proseFail = regexp.MustCompile(`\b(should|shall|will|would|must|can|could|may|might|expected to|doesn't|don't|didn't|won't|cannot|never)[ \t]+fail\b|(\w[ \t]+)fail[ \t]+(against|without)\b`)
+	// modalFail is proseFail's modal half, removed before countFail reads a count: "1 should fail on main" counts nothing.
+	modalFail = regexp.MustCompile(`\b(should|shall|will|would|must|can|could|may|might|expected to|doesn't|don't|didn't|won't|cannot|never)[ \t]+fail\b`)
+	// reportedFail is "did/does/do fail": a report that something failed, never prose to exempt.
+	reportedFail = regexp.MustCompile(`(?i)\b(did|does|do)[ \t]+fail\b`)
+	// countFail is a counted "fail" ("3 tests fail and 9 pass", "1 test fails"): read before proseFail neutralizes.
+	countFail = regexp.MustCompile(`(?i)\b[1-9][0-9]*[ \t]+(\w+[ \t]+)?fails?\b`)
+	// expectedFailures is Python unittest's passing "OK (expected failures=1)": a count of failures that were expected.
+	expectedFailures = regexp.MustCompile(`(?i)\bexpected failures?[ \t]*=[ \t]*[0-9]+`)
+	// ansiEscape is a terminal colour/control sequence: removed first, since "\x1b[31mFAIL" has no word boundary.
+	ansiEscape = regexp.MustCompile(`\x1b\[[0-9;:?]*[ -/]*[@-~]`) // ";" or ":" separates parameters ("\x1b[38:2:255:0:0m")
 )
 
 func Parse(data []byte) (Bundle, error) {
@@ -152,8 +199,9 @@ func parseFreeform(data []byte) Bundle {
 	if text == "" {
 		return Bundle{FreeformText: text, Fallback: true}
 	}
+	plain := ansiEscape.ReplaceAllString(text, "")
 	exitCode := 1
-	if hasSuccessSignal(text) && !hasFailureSignal(text) {
+	if hasSuccessSignal(plain) && !hasFailureSignal(plain) {
 		exitCode = 0
 	}
 	return Bundle{
@@ -178,6 +226,14 @@ func hasSuccessSignal(text string) bool {
 }
 
 func hasFailureSignal(text string) bool {
+	text = expectedFailures.ReplaceAllString(text, " ")
+	text = zeroClause.ReplaceAllString(text, "${1} ")
+	text = zeroLabel.ReplaceAllString(text, " ${1}")
+	if countFail.MatchString(modalFail.ReplaceAllString(text, " ")) {
+		return true
+	}
+	text = reportedFail.ReplaceAllString(text, " failed")
+	text = proseFail.ReplaceAllString(text, "${2} ")
 	for _, pattern := range failurePatterns {
 		if pattern.MatchString(text) {
 			return true

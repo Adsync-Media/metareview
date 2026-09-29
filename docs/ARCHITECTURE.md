@@ -328,6 +328,26 @@ Enforces review-before-push **in git**, not in a command-string parser (which is
   A run with no `--previous-run` adopts nothing — a fresh look at an unchanged diff is never a fix.
 - **Evidence receipts:** `evidence run -- <cmd>` records a validation receipt (kind + exitCode + hashes);
   `evidence import --github-checks <pr>` pulls CI. task-done/pr-ready require a passing validation receipt.
+  Freeform evidence text (no receipts) passes only with a success signal and no failure signal, and failure reading
+  fails closed (`internal/evidence` failurePatterns, run after ANSI escapes are stripped): any "failed", upper-case
+  `FAIL`/`FAILURE`/`FAILURES`, a "fail" verdict ("Result: Fail", `"status":"fail"`, `# fail 1`), `Failures:`/
+  `Errors:` with a nonzero count, `N failing`, `N errors` ending a clause or followed by in/during/generated/found/
+  and, pytest `ERROR` lines, `Traceback`, `TypeError:`-style exception lines, `panicked at`, `Segmentation fault`,
+  `Killed`, TAP `not ok` (indented too), make `Error N`, `error TS…`/`error CS…`/`error[E…]`, `npm ERR!`, go
+  `file.go:L:C:` diagnostics, golangci-lint `N issues:`, `error:`, and a nonzero or negative exit in any common shape.
+  "fail" in any case counts as the base reader's `(?i)\bFAIL\b` did ("Status: Fail because timeout", "lint: fail (3
+  warnings)", "3 tests fail"), except a path segment, file name or compound (`TestX/fail`, `fail.test.ts`, Fail-safe).
+  Exempt (mr-r3y), and nothing else:
+  (1) a lower-case "fail" in prose — after a hypothetical or negated modal ("should fail (3 ms)", "doesn't fail",
+  "expected to fail") or after a subject word and before against/without ("the new tests fail against origin/main");
+  never upper or title case, never "did/does/continues to fail", never after ":"/"=", never when counted ("2 tests
+  fail", though a modal "1 should fail" stays prose);
+  (2) a clause-initial zero report ("…, 0 failed", "no tests failed", bun "0 fail", ctest "0 tests failed out of 5");
+  (3) a zero label that ends there ("Failed: 0, Passed: 5", "# fail 0", "failed=0 skipped=0");
+  (4) unittest's `expected failures=N` ("OK (skipped=1, expected failures=1)").
+  ANSI colour codes (";"- or ":"-separated) are stripped first.
+  A zero that does not start a clause ("shard 0 failed", "Passed: 0 Failed: 3") is a failure, and so is prose such
+  as "TestX failed before the fix" — prefer receipts. Tool shapes neither reader recognizes are tracked in mr-b08.
 - **Sharded review** (exclude-filtered diff > 120 KB): the gate writes prompt packs under
   `.metareview/shards/…/plan.json`; review one subagent per shard + a cross-shard pack, write results, re-run
   with `--previous-run`. Editing a file invalidates only its own shard.
