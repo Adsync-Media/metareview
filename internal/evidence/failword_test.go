@@ -185,13 +185,126 @@ func TestFreeformFailureReadsFailuresNotTheWordFail(t *testing.T) {
 		"exit=1":                 {passing + "exit=1", 1},
 		"return code":            {passing + "return code: 3", 1},
 		"found errors":           {passing + "Found 2 errors.", 1},
+
+		// mr-b08: anchored tool-output shapes the reader did not recognize. Each is pinned to the START of a
+		// line in a fixed format, so prose that merely names the phrase must NOT trip it (the prose cases below).
+		"go panic":                   {passing + "panic: send on closed channel", 1},
+		"go data race":               {"ok  \tpkg\t0.1s\nWARNING: DATA RACE", 1},
+		"aborted core dumped":        {passing + "Aborted (core dumped)", 1},
+		"make no rule":               {passing + "make: *** No rule to make target 'test'.  Stop.", 1},
+		"git fatal":                  {passing + "fatal: not a git repository (or any parent up to mount point /x)", 1},
+		"bash command not found":     {passing + "bash: pytest: command not found", 1},
+		"zsh command not found":      {passing + "zsh: command not found: pytest", 1},
+		"zsh colon not found":        {passing + "zsh:1: command not found: pytest", 1},
+		"indented shell not found":   {passing + "    bash: pytest: command not found", 1},
+		"dash not found":             {passing + "sh: 1: pytest: not found", 1},
+		"no such file or directory":  {passing + "bash: ./run.sh: No such file or directory", 1},
+		"bash line no such file":     {passing + "bash: line 1: ./scripts/verify.sh: No such file or directory", 1},
+		"zsh no such file":           {passing + "zsh: no such file or directory: ./x", 1},
+		"ksh script not found":       {passing + "ci.ksh: 1: cmd: not found", 1},
+		"path sh not found":          {passing + "/bin/sh: 1: pytest: not found", 1},
+		"permission denied":          {passing + "bash: ./scripts/run.sh: Permission denied", 1},
+		"permission denied crlf":     {passing + "bash: ./run.sh: Permission denied\r", 1},
+		"bash builtin denied":        {passing + "bash: cd: /root: Permission denied", 1},
+		"bash script not found":      {passing + "bash: line 1: pytest: command not found", 1},
+		"script permission denied":   {passing + "script.sh: line 3: /x/y: Permission denied", 1},
+		"ssh permission denied":      {passing + "git@github.com: Permission denied (publickey).", 1},
+		"ssh multi-method":           {passing + "git@github.com: Permission denied (publickey,password).", 1},
+		"ssh password only":          {passing + "user@host: Permission denied (password).", 1},
+		"ssh prose mid-line":         {passing + "user@host: Permission denied (publickey) is what the old code did", 0},
+		"zsh permission denied":      {passing + "zsh: permission denied: ./run.sh", 1},
+		"dash permission denied":     {passing + "sh: 1: ./run.sh: Permission denied", 1},
+		"login shell not found":      {passing + "-bash: pytest: command not found", 1},
+		"aborted shell form":         {passing + "bash: line 1: 12345 Aborted (core dumped) ./prog", 1},
+		"aborted padded pid":         {passing + "bash: line 1:  1234 Aborted (core dumped) ./prog", 1},
+		"abort trap":                 {passing + "Abort trap: 6", 1},
+		"abort trap shell":           {passing + "bash: line 1: 12345 Abort trap: 6", 1},
+		"killed shell":               {passing + "bash: line 1: 12345 Killed ./prog", 1},
+		"aborted bare":               {passing + "Aborted", 1},
+		"killed bare":                {passing + "  Killed", 1},
+		"bus error":                  {passing + "Bus error (core dumped)", 1},
+		"bus error bsd":              {passing + "Bus error: 10", 1},
+		"floating point exception":   {passing + "Floating point exception (core dumped)", 1},
+		"illegal instruction":        {passing + "Illegal instruction (core dumped)", 1},
+		"illegal instruction bare":   {passing + "Illegal instruction", 1},
+		"sigill shell":               {passing + "bash: line 1: 12345 Illegal instruction (core dumped) ./prog", 1},
+		"aborted dash form":          {passing + "sh: 1: 12345 Aborted (core dumped)", 1},
+		"quit core dumped":           {passing + "Quit (core dumped)", 1},
+		"quit shell":                 {passing + "bash: line 1: 12345 Quit (core dumped) ./prog", 1},
+		"zsh abort":                  {passing + "zsh: abort ./prog", 1},
+		"zsh bus error":              {passing + "zsh: bus error ./prog", 1},
+		"zsh segmentation fault":     {passing + "zsh: segmentation fault ./prog", 1},
+		"zsh killed":                 {passing + "zsh: killed ./prog", 1},
+		"zsh illegal instruction":    {passing + "zsh: illegal instruction ./prog", 1},
+		"zsh floating point":         {passing + "zsh: floating point exception ./prog", 1},
+		"bus error shell":            {passing + "bash: line 1: 4321 Bus error (core dumped) ./prog", 1},
+		"terminated shell":           {passing + "bash: line 1: 12345 Terminated ./prog", 1},
+		"process terminated":         {passing + "Process terminated by signal 11", 1},
+		"process terminated prose":   {passing + "Process terminated by signal handling is covered", 0},
+		"terminated bare":            {passing + "Terminated", 1},
+		"floating point shell":       {passing + "bash: line 1: 12345 Floating point exception (core dumped) ./prog", 1},
+		"rubocop single file":        {passing + "1 file inspected, 1 offense detected", 1},
+		"pytest no tests ran padded": {passing + "============================ no tests ran in 0.00s ============================", 1},
+		"terminated by signal":       {passing + "Command terminated by signal 11", 1},
+		"pytest no tests ran":        {passing + "no tests ran in 0.01s", 1},
+		"jest no tests found code 1": {passing + "No tests found, exiting with code 1", 1},
+		"jest coverage threshold":    {passing + `Jest: "global" coverage threshold for branches (80%) not met: 66%`, 1},
+		"eslint warnings max 0":      {passing + "ESLint found too many warnings (maximum: 0).", 1},
+		"eslint warnings max 10":     {passing + "too many warnings (maximum: 10)", 1},
+		"prettier code style":        {passing + "[warn] Code style issues found in 2 files. Run Prettier with --write to fix.", 1},
+		"black would reformat":       {passing + "would reformat src/a.py", 1},
+		"black path with spaces":     {passing + "would reformat src/my module.py", 1},
+		"rubocop offenses":           {passing + "5 files inspected, 3 offenses detected", 1},
+		"rspec Failures header":      {passing + "Failures:", 1},
+		"minitest Failure header":    {passing + "  1) Failure:", 1},
+		"prose numbered failure":     {passing + "1) Failure: the reader let Killed through", 0},
+		"json exitCode fragment":     {passing + `"exitCode": 1`, 1},
+		"json exitCode object":       {passing + `{"exitCode": 1}`, 1},
+		"json exitCode midline":      {passing + `{"tool":"go test","status":"passed","exitCode":1}`, 0},
+
+		// prose (or a PASSING tool line) naming the same words must NOT be read as a failure
+		"prose: panic handling":    {passing + "- the state handles panic: by restarting", 0},
+		"prose: permission denied": {passing + "- see bash: ./x: Permission denied", 0},
+		"prose: no tests ran":      {passing + "- note: no tests ran in 0.00s was expected", 0},
+		"prose: terminated signal": {passing + "- the log shows Command terminated by signal 11", 0},
+		"prose: offenses detected": {passing + "- a line with 5 files inspected, 3 offenses detected in prose", 0},
+		// bare (unbulleted) prose naming a phrase must also stay passing - the anchors, not the '- ' prefix, do the work
+		"prose bare not found":        {passing + "command not found handling is covered", 0},
+		"prose not fail":              {passing + "- the suite does not fail on a clean checkout", 0},
+		"prose bare denied":           {passing + "permission denied is handled by the sandbox", 0},
+		"prose bare fatal":            {passing + "the fatal: handling is covered", 0},
+		"prose bare no tests":         {passing + "- see no tests ran in 0.00s", 0},
+		"prose bare offenses":         {passing + "- the report has 5 files inspected, 3 offenses detected", 0},
+		"prose colon tag denied":      {passing + "- Note: permission denied is exercised by the test", 0},
+		"prose ssh denied":            {passing + "- user@host: Permission denied (publickey) is what the old code did", 0},
+		"prose bash denied tail":      {passing + "bash: cmp: Permission denied is expected", 0},
+		"jest passWithNoTests code 0": {passing + "No tests found, exiting with code 0", 0},
+
+		// the modal list (one source behind proseFail/modalFail) stays prose for every modal
+		"modal would fail":  {passing + "- the check would fail without the fix", 0},
+		"modal shall fail":  {passing + "- it shall fail loudly on bad input", 0},
+		"modal can fail":    {passing + "- this path can fail on a bad socket", 0},
+		"modal could fail":  {passing + "- the call could fail on a bad socket", 0},
+		"modal will fail":   {passing + "- the retry will fail on a stale lock", 0},
+		"modal may fail":    {passing + "- the call may fail on a timeout", 0},
+		"modal might fail":  {passing + "- the retry might fail once", 0},
+		"modal don't fail":  {passing + "- these steps don't fail on retry", 0},
+		"modal didn't fail": {passing + "- the migration didn't fail", 0},
+		"modal won't fail":  {passing + "- it won't fail on empty input", 0},
+
+		// expectedFailures failing side: a real failure count beside a passing expected-failures count
+		"failures beside expected": {passing + "Ran 5 tests\n\nfailures=1, expected failures=1", 1},
+		"expected failures alone":  {passing + "Ran 5 tests\n\nOK (expected failures=2)", 0},
 	} {
-		bundle, err := Parse([]byte(tc.text))
-		if err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		if got := bundle.Receipts[0].ExitCode; got != tc.want {
-			t.Errorf("%s: exit %d, want %d", name, got, tc.want)
-		}
+		tc := tc
+		t.Run(name, func(t *testing.T) {
+			bundle, err := Parse([]byte(tc.text))
+			if err != nil {
+				t.Fatalf("%v", err)
+			}
+			if got := bundle.Receipts[0].ExitCode; got != tc.want {
+				t.Errorf("exit %d, want %d", got, tc.want)
+			}
+		})
 	}
 }

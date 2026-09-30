@@ -56,6 +56,15 @@ type ParseOptions struct {
 	MaxAge time.Duration
 }
 
+// modalVerb gates a hypothetical or negated "fail" ("should fail", "doesn't fail"). One source behind both
+// proseFail and modalFail, so the two lists can never drift apart (mr-b08).
+const modalVerb = `should|shall|will|would|must|can|could|may|might|expected to|not|doesn't|don't|didn't|won't|cannot|never`
+
+// shellTag is the shell name (bash/sh/dash/zsh/ash/ksh, optional leading -) or a script (\S+ ending .sh/
+// .bash/.zsh/.dash/.ash/.ksh) a shell prints before its message, shared by the shell-shape patterns below
+// (mr-b08) so the alternatives cannot drift between them.
+const shellTag = `(?:(?:[^\s:]*/)?-?(?:bash|sh|dash|zsh|ash|ksh)|\S+\.(?:sh|bash|zsh|dash|ash|ksh))`
+
 var (
 	successPatterns = []*regexp.Regexp{
 		regexp.MustCompile(`(?m)^ok\s+\S+`),
@@ -70,6 +79,7 @@ var (
 	// or a report.
 	failurePatterns = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)\b(exit(ed)?|exit[ _-]?code|exit[ _-]?status|return[ _-]?code|exited with( code| status)?|exit (code|status) (was|is))\s*[:=]?\s*-?[1-9][0-9]*\b|\brc[ \t]*[:=][ \t]*-?[1-9]`),
+		regexp.MustCompile(`(?mi)^\s*[{,]?\s*"exit_?code"\s*[:=]\s*"?-?[1-9]`),                                                              // a line-led JSON/RPC exitCode key
 		regexp.MustCompile(`\bFAIL(URES?)?\b`),                                                                                              // FAIL, BUILD FAILURE, FAILURES! (upper case)
 		regexp.MustCompile(`(?im)(^|[^/\w])fail($|[^-.\w]|-($|\W)|\.($|\W))`),                                                               // "fail" in any case — not a path segment (TestX/fail), file (fail.test.ts) or compound (Fail-safe); prose is neutralized first (proseFail)
 		regexp.MustCompile(`(?i)\bfailed\b`),                                                                                                // any form: "Failed: 1", "Command failed.", "go vet failed"
@@ -85,6 +95,55 @@ var (
 		regexp.MustCompile(`\berror (TS|CS)[0-9]+`),                                                                                         // tsc, MSBuild
 		regexp.MustCompile(`(?i)\bnpm (ERR!|error)`),
 		regexp.MustCompile(`(?i)\berror:`),
+	}
+	// lineFailurePatterns are anchored tool-output shapes (mr-b08): each matches from the START of a line
+	// (multiline ^) in a fixed tool format. Where the phrase can also appear in prose it must be preceded by
+	// a fixed token (a shell tag, or a program/path plus "line N:") with its own bounds pinned, so prose that
+	// merely names the phrase - "covers the permission-denied path", "command not found handling is covered"
+	// - never reads as a failure; where the phrase IS the whole line (a bare "Failures:" header), the shape is
+	// that line alone. (failurePatterns also holds a few line-anchored shapes; this list groups the added
+	// ones.) A shape that cannot be pinned this tightly (a bare "timed out", a non-shell tool's EACCES, an
+	// errored/crashed count with no fixed prologue) is deliberately NOT a pattern: prefer an evidence receipt.
+	lineFailurePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?m)^panic: `),              // Go panic ("panic: send on closed channel")
+		regexp.MustCompile(`(?m)^WARNING: DATA RACE\b`), // Go race detector
+		// SIGABRT: glibc's bare "Aborted" / "Aborted (core dumped)", macOS/BSD's "Abort trap", or a shell's
+		// "<shell>: [line N: |N:] PID Aborted ...".
+		regexp.MustCompile(`(?m)^\s*Aborted(?:\s+\(core dumped\))?\s*\r?$`),
+		regexp.MustCompile(`(?m)^\s*Abort trap: [0-9]+\s*\r?$`),
+		regexp.MustCompile(`(?m)^\s*(?:Bus error|Illegal instruction|Floating point exception|Quit)(?:\s+\(core dumped\)|: [0-9]+)?\s*\r?$`), // SIGBUS/SIGILL/SIGFPE/SIGQUIT (glibc; BSD "Bus error: 10")
+		// A shell's crash line: "<shell>: [line N: |N:] PID <signal> ..." (Aborted, Abort trap, Bus error,
+		// Illegal instruction, Floating point exception, Segmentation fault, Killed, Terminated, Quit), plus
+		// zsh's PID-less lowercase names.
+		regexp.MustCompile(`(?m)^\s*(?:` + shellTag + `): (?:line [0-9]+: |[0-9]+: )?[ \t]*[0-9]+ (?:Aborted|Abort trap|Bus error|Illegal instruction|Floating point exception|Segmentation fault|Killed|Terminated|Quit)\b`),
+		regexp.MustCompile(`(?mi)^\s*(?:` + shellTag + `): (?:abort|bus error|illegal instruction|segmentation fault|floating point exception|killed|terminated|quit)\b`),
+		regexp.MustCompile(`(?m)^\s*Terminated\s*\r?$`),            // bare SIGTERM line
+		regexp.MustCompile(`(?m)^\s*make(?:\[[0-9]+\])?: \*\*\* `), // make fatal ("No rule to make target")
+		regexp.MustCompile(`(?m)^fatal: `),                         // git fatal
+		// Missing command / EACCES as a shell reports it. The tag is a shell (or a script) name, so a prose
+		// line like "Note: permission denied ..." is not read as a shell error.
+		//   bash/zsh: "bash: [line N:] cmd: command not found" / "...: path: Permission denied"
+		//   shell:    "sh: 1: cmd: not found" / "sh: 1: path: Permission denied" / "...: No such file or directory"
+		//   zsh:      "zsh: command not found: cmd" / "zsh: permission denied: path"
+		regexp.MustCompile(`(?mi)^\s*(?:` + shellTag + `): (?:line [0-9]+: |[0-9]+: )?(?:\S+: ){1,2}command not found\s*\r?$`),
+		regexp.MustCompile(`(?mi)^\s*(?:` + shellTag + `): (?:line [0-9]+: |[0-9]+: )?(?:\S+: ){1,2}permission denied\s*\r?$`),
+		regexp.MustCompile(`(?mi)^\s*(?:` + shellTag + `): (?:line [0-9]+: |[0-9]+: )?(?:\S+: ){1,2}(?:not found|No such file or directory)\s*\r?$`),
+		regexp.MustCompile(`(?mi)^\s*(?:` + shellTag + `):(?:[0-9]+:)?\s+command not found: \S+`),
+		regexp.MustCompile(`(?mi)^\s*(?:` + shellTag + `):(?:[0-9]+:)?\s+permission denied: \S+`),
+		regexp.MustCompile(`(?mi)^\s*(?:` + shellTag + `):(?:[0-9]+:)?\s+no such file or directory: \S+`),
+		regexp.MustCompile(`(?m)^\s*Killed\s*\r?$`),                                       // bare SIGKILL line (any indent)
+		regexp.MustCompile(`(?mi)^\S+@\S+: permission denied \([^)]*\)\.?\s*\r?$`),        // ssh/scp ("git@host: Permission denied (publickey…).")
+		regexp.MustCompile(`(?m)^(?:Command|Process) terminated by signal \S+[ \t]*\r?$`), // signal kill (GNU time / runner)
+		// pytest's "no tests ran in Ns" (exit 5), bare or '='-padded ("===== no tests ran in 0.0s =====").
+		regexp.MustCompile(`(?m)^(?:=+[ \t]*)?no tests ran in [0-9.]+s(?:[ \t]*=+)?[ \t]*\r?$`),
+		regexp.MustCompile(`(?m)^No tests found, exiting with code [1-9]`),                   // jest (NOT passWithNoTests code 0)
+		regexp.MustCompile(`(?m)^Jest: [^\n]*coverage threshold[^\n]*not met`),               // jest coverage gate
+		regexp.MustCompile(`(?m)^(?:ESLint found )?too many warnings \(maximum: [0-9]+\)`),   // eslint --max-warnings N
+		regexp.MustCompile(`(?m)^would reformat [^\r\n]+[ \t]*\r?$`),                         // black --check (path may contain spaces)
+		regexp.MustCompile(`(?m)^\[warn\] Code style issues found\b`),                        // prettier --check
+		regexp.MustCompile(`(?m)^[0-9]+ files? inspected, [1-9][0-9]* offenses? detected\b`), // rubocop summary
+		regexp.MustCompile(`(?m)^\s*Failures?:\s*\r?$`),                                      // rspec bare "Failures:" header
+		regexp.MustCompile(`(?m)^\s*[0-9]+\) Failure:\s*\r?$`),                               // minitest numbered "1) Failure:" (whole line)
 	}
 	// zeroClause and zeroLabel report that nothing failed; they are neutralized before failurePatterns run. Both are
 	// narrow on purpose, so they can never swallow a real failure:
@@ -105,9 +164,9 @@ var (
 	// Never "did/does fail" (a report, rewritten to "failed" first),
 	// never upper or title case (a verdict), never after ":" or "=" ("Status: fail on windows"). It is neutralized after
 	// a counted "fail" ("2 tests fail on windows") has already been read as a failure.
-	proseFail = regexp.MustCompile(`\b(should|shall|will|would|must|can|could|may|might|expected to|doesn't|don't|didn't|won't|cannot|never)[ \t]+fail\b|(\w[ \t]+)fail[ \t]+(against|without)\b`)
+	proseFail = regexp.MustCompile(`\b(` + modalVerb + `)[ \t]+fail\b|(\w[ \t]+)fail[ \t]+(against|without)\b`)
 	// modalFail is proseFail's modal half, removed before countFail reads a count: "1 should fail on main" counts nothing.
-	modalFail = regexp.MustCompile(`\b(should|shall|will|would|must|can|could|may|might|expected to|doesn't|don't|didn't|won't|cannot|never)[ \t]+fail\b`)
+	modalFail = regexp.MustCompile(`\b(` + modalVerb + `)[ \t]+fail\b`)
 	// reportedFail is "did/does/do fail": a report that something failed, never prose to exempt.
 	reportedFail = regexp.MustCompile(`(?i)\b(did|does|do)[ \t]+fail\b`)
 	// countFail is a counted "fail" ("3 tests fail and 9 pass", "1 test fails"): read before proseFail neutralizes.
@@ -234,9 +293,13 @@ func hasFailureSignal(text string) bool {
 	}
 	text = reportedFail.ReplaceAllString(text, " failed")
 	text = proseFail.ReplaceAllString(text, "${2} ")
-	for _, pattern := range failurePatterns {
-		if pattern.MatchString(text) {
-			return true
+	// The two slices are scanned identically; failurePatterns holds the base shapes (some also line-anchored)
+	// and lineFailurePatterns the mr-b08 anchored shapes.
+	for _, patterns := range [][]*regexp.Regexp{failurePatterns, lineFailurePatterns} {
+		for _, pattern := range patterns {
+			if pattern.MatchString(text) {
+				return true
+			}
 		}
 	}
 	return false
@@ -310,7 +373,7 @@ func (bundle Bundle) ValidationSummaries() []string {
 		}
 		prefix := "structured validation"
 		if bundle.Fallback {
-			prefix = "freeform fallback validation"
+			prefix = "freeform fallback validation (best-effort; prefer an evidence receipt)"
 		}
 		status := fmt.Sprintf("exit %d", receipt.ExitCode)
 		if receipt.Kind == ReceiptKindCICheck {
