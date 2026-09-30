@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/dsifry/metareview/internal/fsm/converge"
 	"github.com/dsifry/metareview/internal/fsm/errs"
@@ -44,6 +45,9 @@ type session struct {
 	cmdCalls map[string]int // prior cmd_call count per command name (durable ordinal for mocks)
 	unlock   func()
 }
+
+// maxIDAttempts bounds how many generated run ids Init tries when the store already has one (#180).
+const maxIDAttempts = 16
 
 var recordName = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
 
@@ -179,10 +183,6 @@ func Init(ctx context.Context, deps Deps, o InitOptions) (*Machine, error) {
 	}
 	// 6. create, sidecar, first events
 	now := deps.Clock()
-	runID := o.RunID
-	if runID == "" {
-		runID = run.RunID(w.Name, now.Time)
-	}
 	var initialKind run.Kind
 	if n := w.NodeFor(w.Initial); n != nil {
 		initialKind = run.Kind(n.Kind)
@@ -190,17 +190,36 @@ func Init(ctx context.Context, deps Deps, o InitOptions) (*Machine, error) {
 	if allowed == nil {
 		allowed = []run.AllowedCmd{}
 	}
-	initData := run.InitData{
-		RunID: runID, CreatedAt: now, Workflow: w.Name, WorkflowHash: w.Hash, Vars: vars, Calibration: o.Calibration,
-		Mock: mock, RepoMode: w.RepoMode, AllowedCmds: allowed, CmdsSHA256: sha, RepoRoot: o.RepoRoot, WorkDir: o.WorkDir,
-		BaseSHA: baseSHA, RequestedBase: o.Base, Branch: o.Branch, Head: head, InitialState: w.Initial, InitialKind: initialKind, Goldens: goldens, Lineage: []string{}, WorkflowSource: source,
+	var (
+		runID string
+		st    run.FoldState
+	)
+	// A generated id is the init time to the nanosecond plus the workflow; runs started at once in several
+	// worktrees (#180) can land on one id on a clock with microsecond resolution. The store refuses the second,
+	// and it takes the next microsecond instead.
+	for attempt := 0; ; attempt++ {
+		runID = o.RunID
+		if runID == "" {
+			runID = run.RunID(w.Name, now.Time)
+		}
+		initData := run.InitData{
+			RunID: runID, CreatedAt: now, Workflow: w.Name, WorkflowHash: w.Hash, Vars: vars, Calibration: o.Calibration,
+			Mock: mock, RepoMode: w.RepoMode, AllowedCmds: allowed, CmdsSHA256: sha, RepoRoot: o.RepoRoot, WorkDir: o.WorkDir,
+			BaseSHA: baseSHA, RequestedBase: o.Base, Branch: o.Branch, Head: head, InitialState: w.Initial, InitialKind: initialKind, Goldens: goldens, Lineage: []string{}, WorkflowSource: source,
+			Writer: run.ReaderVersion,
+		}
+		first := run.Event{SchemaVersion: run.SchemaVersion, At: now, Type: run.TypeInit, Data: run.MarshalCanonical(initData)}
+		st, err = deps.Store.Create(runID, first)
+		var se *run.StoreError
+		if o.RunID != "" || attempt == maxIDAttempts-1 || !errors.As(err, &se) || se.Code != run.CodeRunExists {
+			break
+		}
+		now = run.Time{Time: now.Add(time.Microsecond)}
 	}
-	m := &Machine{deps: deps, runID: runID}
-	first := run.Event{SchemaVersion: run.SchemaVersion, At: now, Type: run.TypeInit, Data: run.MarshalCanonical(initData)}
-	st, err := deps.Store.Create(runID, first)
 	if err != nil {
 		return nil, err
 	}
+	m := &Machine{deps: deps, runID: runID}
 	if err := deps.Sidecar.Write(runID, SidecarWorkflow, raw); err != nil {
 		return nil, err
 	}
@@ -588,6 +607,14 @@ func (s *session) advance() (AdvanceResult, error) {
 		}
 		return AdvanceResult{}, errs.E(CodeRunTerminal, "run is terminal", "outcome", string(snap.Outcome))
 	}
+	// A run already in its fix node holds its worktree's edit lock before the host is handed that node again
+	// (re-entrant for the run that took it on the way in). This also covers a run that never took it: one begun
+	// before 0.14, or a workflow whose first state is a fix (#180).
+	if snap.StateKind == run.KindAgentEdit {
+		if err := s.editLock(func(l EditLocker) error { return l.Acquire(s.m.runID) }); err != nil {
+			return AdvanceResult{}, err
+		}
+	}
 	// 4. tree
 	head, err := s.git.Head(s.ctx)
 	if err != nil {
@@ -923,6 +950,13 @@ func (s *session) fail(first *run.GateError, head string) (AdvanceResult, error)
 func (s *session) finish(td run.TransitionData, stopReason ...string) (AdvanceResult, error) {
 	snap := s.st.Snapshot
 	resuming := snap.Outcome != ""
+	if !resuming && td.ToKind == run.KindAgentEdit {
+		// Before anything is appended: a second run fixing in this worktree fails fast here and stays where it
+		// was, so it can retry once the holder leaves its fix node (#180).
+		if err := s.editLock(func(l EditLocker) error { return l.Acquire(s.m.runID) }); err != nil {
+			return AdvanceResult{}, err
+		}
+	}
 	if !resuming {
 		ev := s.stamp(run.TypeTransition, td, "")
 		if td.Loop {
@@ -930,6 +964,9 @@ func (s *session) finish(td run.TransitionData, stopReason ...string) (AdvanceRe
 		}
 		if err := s.appendEvent(ev); err != nil {
 			return AdvanceResult{}, err
+		}
+		if td.ToKind != run.KindAgentEdit && snap.StateKind == run.KindAgentEdit {
+			s.releaseEditLock()
 		}
 	}
 	if td.Outcome == run.OutcomeOverflow && s.w.OnOverflow != "" && !s.st.OverflowHandled {
@@ -1005,10 +1042,25 @@ func (s *session) overflowHandler() error {
 }
 
 func (s *session) terminal() error {
+	s.releaseEditLock()
 	if s.m.deps.Terminal == nil {
 		return nil
 	}
 	return s.m.deps.Terminal(s.ctx, s.viewOf())
+}
+
+// editLock runs fn on the run's worktree edit lock, when the machine has one.
+func (s *session) editLock(fn func(EditLocker) error) error {
+	if s.m.deps.EditLock == nil {
+		return nil
+	}
+	return fn(s.m.deps.EditLock(s.st.WorkDir))
+}
+
+// releaseEditLock drops the run's hold on its worktree's edit lock. It is best effort: a hold left behind by a
+// failed release is stale once the run leaves its fix node, and the next run takes it over.
+func (s *session) releaseEditLock() {
+	_ = s.editLock(func(l EditLocker) error { return l.Release(s.m.runID) })
 }
 
 func untrusted(gd *run.GateData, warns []string, stop string) []string {

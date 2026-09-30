@@ -36,6 +36,17 @@ func Apply(st FoldState, ev Event) (FoldState, error) {
 	if !knownType(ev.Type) {
 		return FoldState{}, foldErr(ReasonUnknownType, ev)
 	}
+	if ev.Type == TypeInit {
+		// Read loosely, before the strict decode below: a newer writer may add init fields this reader rejects
+		// as unknown, and it must be refused as newer (ERR_AUDIT_VERSION), not as malformed.
+		var envelope struct {
+			Writer string `json:"writer"`
+		}
+		_ = json.Unmarshal(ev.Data, &envelope)
+		if newerWriter(envelope.Writer, ReaderVersion) {
+			return FoldState{}, foldErr(ReasonNewerWriter, ev)
+		}
+	}
 	canon, err := Canonical(ev.Data)
 	if err != nil {
 		return FoldState{}, foldErr(ReasonBadPayload, ev)
