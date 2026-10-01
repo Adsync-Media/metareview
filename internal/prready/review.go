@@ -1026,11 +1026,18 @@ func reviewerLogs(logs []reviewlog.Summary) []reviewers.PRReviewLog {
 // already been resolved. The report still receives the unfiltered logs and
 // renders those historical records with their resolver, but a path overlap
 // cannot make a cleared finding block a new PR-ready target.
+//
+// The gate uses reviewstate.LogBlockersResolvedInLedger — strict about the log's BLOCKING findings
+// (an ID the ledger does not know, or fewer vouched than the run raised, keeps the log a gate input),
+// so resolving the IDs a ledger happens to know can never retire a log that also lists a blocker
+// nobody's ledger ever held (mr-ik7). It is deliberately not strict about the advisory/quoted IDs in
+// FindingIDs — those would otherwise block a log forever — and the rendered evidence keeps the plain
+// lenient reading (it renders, it does not gate).
 func gateReviewLogs(logs []reviewlog.Summary, ledger []findings.Record) []reviewlog.Summary {
 	byID := indexFindings(ledger)
 	result := make([]reviewlog.Summary, 0, len(logs))
 	for _, log := range logs {
-		if reconcileReview(FromReviewLog(log), byID).Resolved {
+		if reviewstate.LogBlockersResolvedInLedger(log, byID) {
 			continue
 		}
 		result = append(result, log)
